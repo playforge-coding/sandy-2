@@ -123,6 +123,17 @@ impl ApplicationHandler<UserEvent> for App {
                 self.input.cursor = (position.x, position.y);
             }
 
+            // Drag a `.rhai` plugin onto the window to "upload" it: it compiles,
+            // joins the registry, shows up in the picker, and is selected ready
+            // to paint. A bad script is logged and otherwise ignored.
+            WindowEvent::DroppedFile(path) => match crate::plugin::load_path(&path) {
+                Ok(id) => {
+                    log::info!("loaded plugin material {id} from {path:?}");
+                    self.input.material = id;
+                }
+                Err(e) => log::error!("failed to load plugin {path:?}: {e}"),
+            },
+
             WindowEvent::MouseInput { state: btn, button: MouseButton::Left, .. } => {
                 if btn == ElementState::Pressed {
                     // A press on the picker selects a material; anywhere else
@@ -179,6 +190,8 @@ impl App {
             KeyCode::Digit2 => self.input.material = 2, // Stone
             KeyCode::Digit3 => self.input.material = 3, // Water
             KeyCode::Digit4 => self.input.material = 4, // Lava
+            KeyCode::Digit5 => self.input.material = 5, // Oil
+            KeyCode::Digit6 => self.input.material = 6, // Fire
             KeyCode::Digit0 | KeyCode::Backspace => self.input.material = EMPTY, // Eraser
             // Brush size.
             KeyCode::BracketLeft => self.input.brush = (self.input.brush - 1).max(0),
@@ -207,8 +220,15 @@ pub fn run() {
         let _ = console_log::init_with_level(log::Level::Info);
     }
 
+    // Auto-load any plugin materials sitting in ./plugins so they're in the
+    // picker from the first frame. (No such folder is the normal case.)
+    let loaded = crate::plugin::load_dir(std::path::Path::new("plugins"));
+    if loaded > 0 {
+        log::info!("loaded {loaded} plugin material(s) from ./plugins");
+    }
+
     log::info!(
-        "Controls: click the picker (top-left) or 1=Sand  2=Stone  3=Water  4=Lava  0/Backspace=Erase  [ ]=brush size  C=clear  (hold left mouse to draw)"
+        "Controls: click the picker (top-left) or 1=Sand  2=Stone  3=Water  4=Lava  5=Oil  6=Fire  0/Backspace=Erase  [ ]=brush size  C=clear  (hold left mouse to draw)  — drag a .rhai file onto the window to add a material"
     );
 
     let event_loop = EventLoop::<UserEvent>::with_user_event()

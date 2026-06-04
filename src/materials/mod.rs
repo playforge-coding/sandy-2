@@ -9,17 +9,31 @@
 //!
 //! 1. Create `src/materials/<name>.rs` (copy `sand.rs` or `stone.rs`).
 //! 2. `mod <name>;` it below.
-//! 3. Add `&<name>::<Type>` to [`REGISTRY`].
+//! 3. Add it to [`builtins`].
 //!
 //! If it moves like something that already exists, point its `update` at the
 //! matching `behaviors::*` helper and you're done. If it needs genuinely new
 //! motion, add a helper in `behaviors.rs` and call that instead.
+//!
+//! # The registry is built at runtime
+//!
+//! The set of materials is no longer a compile-time constant: the built-ins are
+//! seeded first (in a fixed order, so their ids/key-bindings never move), and
+//! [`register`] appends more at runtime. That's what lets [`crate::plugin`] load
+//! a material from a script the user drops in and have it show up in the picker.
+//! Built-ins and plugins are the same `&dyn Material` to everyone else — `sim`,
+//! `ui`, and `gpu` only ever go through [`get`]/[`count`] and never learn which
+//! is which.
 
 mod empty;
+mod fire;
 mod lava;
+mod oil;
 mod sand;
 mod stone;
 mod water;
+
+use std::cell::RefCell;
 
 use crate::sim::Simulation;
 
@@ -34,6 +48,8 @@ pub const EMPTY: MaterialId = 0;
 pub const STONE: MaterialId = 2;
 pub const WATER: MaterialId = 3;
 pub const LAVA: MaterialId = 4;
+pub const OIL: MaterialId = 5;
+pub const FIRE: MaterialId = 6;
 
 /// A material's static, render- and physics-relevant properties.
 #[derive(Clone, Copy)]
@@ -76,9 +92,15 @@ impl MaterialInfo {
     }
 }
 
-/// One material kind. Implemented once per material file. Implementors are
-/// zero-sized and stored as `'static` trait objects in [`REGISTRY`].
-pub trait Material: Sync {
+/// One material kind. Built-ins are zero-sized; plugin materials carry a script
+/// engine. Either way the registry stores them as `&'static dyn Material` (see
+/// [`register`]), so [`get`] can hand one out without borrowing the simulation —
+/// which is what lets `Simulation::step` call `get(id).update(self, …)` freely.
+///
+/// Not `Sync`: a plugin material owns a script interpreter that isn't shareable
+/// across threads. The whole simulation runs on one thread, so that's fine and
+/// the registry lives in a `thread_local` rather than a `static`.
+pub trait Material {
     /// Static properties (name, colour, density, …).
     fn info(&self) -> MaterialInfo;
 
@@ -87,26 +109,67 @@ pub trait Material: Sync {
     fn update(&self, sim: &mut Simulation, x: usize, y: usize);
 }
 
-/// ===================== ADD NEW MATERIALS HERE =====================
-/// The position in this array is the material's id, so keep `Empty` first and
-/// don't reorder existing entries (key bindings / saved scenes use ids).
-pub static REGISTRY: &[&dyn Material] = &[
-    &empty::Empty, // id 0
-    &sand::Sand,   // id 1
-    &stone::Stone, // id 2
-    &water::Water, // id 3
-    &lava::Lava,   // id 4
-];
+/// ===================== ADD NEW BUILT-IN MATERIALS HERE =====================
+/// The position here is the material's id, so keep `Empty` first and don't
+/// reorder existing entries (key bindings / saved scenes use ids). Plugins are
+/// appended after these by [`register`].
+fn builtins() -> Vec<&'static dyn Material> {
+    // ZSTs promoted to `'static`; referencing them gives `&'static dyn Material`.
+    static EMPTY: empty::Empty = empty::Empty; // id 0
+    static SAND: sand::Sand = sand::Sand; // id 1
+    static STONE: stone::Stone = stone::Stone; // id 2
+    static WATER: water::Water = water::Water; // id 3
+    static LAVA: lava::Lava = lava::Lava; // id 4
+    static OIL: oil::Oil = oil::Oil; // id 5
+    static FIRE: fire::Fire = fire::Fire; // id 6
+    vec![&EMPTY, &SAND, &STONE, &WATER, &LAVA, &OIL, &FIRE]
+}
 
-/// Look up a material by id. `'static` — never borrows the simulation, which
-/// is what lets `Simulation::step` call `get(id).update(self, …)` freely.
+thread_local! {
+    /// The live material table: built-ins, then any plugins, indexed by id.
+    /// Single-threaded, so a `thread_local` is all the sharing we need.
+    static REGISTRY: RefCell<Vec<&'static dyn Material>> = RefCell::new(builtins());
+}
+
+/// Look up a material by id. The returned reference is `'static` (it points into
+/// the registry's leaked entries), so the borrow of the registry ends the moment
+/// this returns — `update` can then freely take `&mut Simulation`, and a plugin
+/// script running inside `update` can call back into [`get`] without deadlocking.
 #[inline]
 pub fn get(id: MaterialId) -> &'static dyn Material {
-    REGISTRY[id as usize]
+    REGISTRY.with(|r| r.borrow()[id as usize])
 }
 
 /// Number of registered materials (including Empty). Used by the material
 /// picker to lay out one row per material.
 pub fn count() -> usize {
-    REGISTRY.len()
+    REGISTRY.with(|r| r.borrow().len())
+}
+
+/// Append a material to the registry and return its freshly-assigned id. The
+/// material must be `'static`; plugin loaders leak their `ScriptMaterial` (it
+/// lives for the rest of the run anyway) to satisfy this. Ids only ever grow, so
+/// existing cells/selection stay valid. Returns `None` if the id space (`u8`) is
+/// full.
+pub fn register(material: &'static dyn Material) -> Option<MaterialId> {
+    REGISTRY.with(|r| {
+        let mut v = r.borrow_mut();
+        if v.len() > MaterialId::MAX as usize {
+            return None;
+        }
+        let id = v.len() as MaterialId;
+        v.push(material);
+        Some(id)
+    })
+}
+
+/// Find a material by (case-insensitive) name, e.g. so a plugin can ask for the
+/// id of `"Water"` to react with it. Returns the first match.
+pub fn id_by_name(name: &str) -> Option<MaterialId> {
+    REGISTRY.with(|r| {
+        r.borrow()
+            .iter()
+            .position(|m| m.info().name.eq_ignore_ascii_case(name))
+            .map(|i| i as MaterialId)
+    })
 }

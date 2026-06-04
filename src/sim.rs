@@ -71,6 +71,14 @@ impl Simulation {
         self.rand() & 1 == 0
     }
 
+    /// True with probability `1/n` — a rarity dial for stochastic behaviours
+    /// (fire guttering out, lava spitting a flame). `n == 0` is treated as `1`
+    /// (always true) so callers needn't guard against it.
+    #[inline]
+    pub(crate) fn chance(&mut self, n: u32) -> bool {
+        self.rand() % n.max(1) == 0
+    }
+
     /// Try to move/swap the cell at `(sx,sy)` into `(tx,ty)`, if the source can
     /// displace whatever is there. Returns whether it moved. This is where the
     /// density/`movable` rules live, shared by every behaviour.
@@ -188,8 +196,10 @@ impl Simulation {
         }
     }
 
-    #[cfg(test)]
-    fn mat_at(&self, x: usize, y: usize) -> MaterialId {
+    /// The material id at `(x, y)`. Used by tests and by the plugin host API so
+    /// a script can sense what's in a cell.
+    #[inline]
+    pub(crate) fn mat_at(&self, x: usize, y: usize) -> MaterialId {
         self.cells[self.idx(x, y)].mat
     }
 }
@@ -202,6 +212,8 @@ mod tests {
     const STONE: MaterialId = 2;
     const WATER: MaterialId = 3;
     const LAVA: MaterialId = 4;
+    const OIL: MaterialId = 5;
+    const FIRE: MaterialId = 6;
 
     #[test]
     fn sand_falls_to_the_floor() {
@@ -238,6 +250,79 @@ mod tests {
         sim.step();
         assert_eq!(sim.mat_at(10, y), STONE);
         assert_eq!(sim.mat_at(11, y), STONE);
+    }
+
+    #[test]
+    fn oil_floats_on_water() {
+        // Oil is lighter than water, so a grain of oil dropped into a water
+        // column should end up sitting above the water, not below it.
+        let mut sim = Simulation::new();
+        let floor = GRID_H - 1;
+        sim.set(10, floor, OIL);
+        sim.set(10, floor - 1, WATER);
+        for _ in 0..50 {
+            sim.step();
+        }
+        assert_eq!(sim.mat_at(10, floor), WATER);
+        assert_eq!(sim.mat_at(10, floor - 1), OIL);
+    }
+
+    #[test]
+    fn oil_catches_fire_from_flame() {
+        // Oil next to fire ignites: the oil cell turns into fire on contact.
+        let mut sim = Simulation::new();
+        let y = GRID_H - 1;
+        sim.set(10, y, OIL);
+        sim.set(11, y, FIRE);
+        sim.step();
+        assert_eq!(sim.mat_at(10, y), FIRE);
+    }
+
+    #[test]
+    fn oil_catches_fire_from_lava() {
+        // Lava lights oil too, and unlike water+lava the lava is not consumed.
+        let mut sim = Simulation::new();
+        let y = GRID_H - 1;
+        sim.set(10, y, OIL);
+        sim.set(11, y, LAVA);
+        sim.step();
+        assert_eq!(sim.mat_at(10, y), FIRE);
+        assert_eq!(sim.mat_at(11, y), LAVA);
+    }
+
+    #[test]
+    fn fire_burns_out() {
+        // Fire has no fuel of its own, so a lone flame eventually vanishes.
+        let mut sim = Simulation::new();
+        sim.set(10, GRID_H - 1, FIRE);
+        for _ in 0..(GRID_H * 4) {
+            sim.step();
+        }
+        for x in 0..GRID_W {
+            for y in 0..GRID_H {
+                assert_ne!(sim.mat_at(x, y), FIRE, "fire should have burned out");
+            }
+        }
+    }
+
+    #[test]
+    fn lava_gives_off_fire() {
+        // A pool of lava with air above it should, over many ticks, spit at
+        // least one flame into the air.
+        let mut sim = Simulation::new();
+        let floor = GRID_H - 1;
+        for x in 0..GRID_W {
+            sim.set(x, floor, LAVA);
+        }
+        let mut saw_fire = false;
+        for _ in 0..200 {
+            sim.step();
+            if (0..GRID_W).any(|x| sim.mat_at(x, floor - 1) == FIRE) {
+                saw_fire = true;
+                break;
+            }
+        }
+        assert!(saw_fire, "lava should give off fire over time");
     }
 
     #[test]

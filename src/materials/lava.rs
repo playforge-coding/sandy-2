@@ -4,11 +4,15 @@
 //! Motion is delegated to [`behaviors::liquid`], exactly like water; the only
 //! difference is the lower `speed` (viscosity) it passes.
 
-use super::{Material, MaterialInfo, STONE, WATER};
+use super::{Material, MaterialInfo, FIRE, STONE, WATER};
 use crate::behaviors;
 use crate::sim::Simulation;
 
 pub struct Lava;
+
+/// Rarity of lava spitting out a flame: roughly one chance in this many ticks
+/// per cell, so a pool of lava gently flickers fire above itself.
+const SPIT_FIRE: u32 = 40;
 
 impl Material for Lava {
     fn info(&self) -> MaterialInfo {
@@ -28,6 +32,8 @@ impl Material for Lava {
         if behaviors::react_on_contact(sim, x, y, WATER, STONE) {
             return;
         }
+        // Every so often, throw off a flame into the air above.
+        behaviors::emit(sim, x, y, FIRE, SPIT_FIRE);
         // Viscous: only flows one cell sideways per tick, so it stays in blobs.
         behaviors::liquid(sim, x, y, 1);
     }

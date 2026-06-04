@@ -19,6 +19,7 @@ path = "src/main.rs"
 winit = "0.30.13"
 wgpu = "29.0.3"
 log = "0.4"
+rhai = "1.25.1"
 
 # ---- Desktop only ----
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

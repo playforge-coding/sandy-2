@@ -9,7 +9,7 @@
 //! (`try_move`, `rand_bool`, …) and never touch material-specific data, so any
 //! material can call any of them.
 
-use crate::materials::MaterialId;
+use crate::materials::{MaterialId, EMPTY};
 use crate::sim::Simulation;
 
 /// React on contact: if any neighbour of `(x,y)` is `trigger`, turn both this
@@ -29,6 +29,52 @@ pub fn react_on_contact(
 ) -> bool {
     if let Some((nx, ny)) = sim.neighbor(x, y, trigger) {
         sim.set(x, y, product);
+        sim.set(nx, ny, product);
+        true
+    } else {
+        false
+    }
+}
+
+/// One-sided reaction: if any neighbour of `(x,y)` is `trigger`, turn *only*
+/// this cell into `product` (the neighbour is left untouched) and report it.
+///
+/// Where [`react_on_contact`] consumes both cells, here the trigger is a
+/// catalyst that survives — exactly what a spreading effect wants: oil next to
+/// fire or lava ignites, but the flame or lava that lit it stays put and can go
+/// on to light the next cell. Returns `true` if it transformed.
+pub fn transform_on_contact(
+    sim: &mut Simulation,
+    x: usize,
+    y: usize,
+    trigger: MaterialId,
+    product: MaterialId,
+) -> bool {
+    if sim.neighbor(x, y, trigger).is_some() {
+        sim.set(x, y, product);
+        true
+    } else {
+        false
+    }
+}
+
+/// Occasionally shed a `product` particle into an adjacent empty cell — a
+/// source that gives something off (lava spitting fire, water steaming). With
+/// probability `1/rarity` per tick it fills the first empty orthogonal
+/// neighbour (favouring the one above, since most emissions rise) and returns
+/// `true`. Does nothing — and returns `false` — when it doesn't fire or when the
+/// cell is fully boxed in.
+pub fn emit(
+    sim: &mut Simulation,
+    x: usize,
+    y: usize,
+    product: MaterialId,
+    rarity: u32,
+) -> bool {
+    if !sim.chance(rarity) {
+        return false;
+    }
+    if let Some((nx, ny)) = sim.neighbor(x, y, EMPTY) {
         sim.set(nx, ny, product);
         true
     } else {
@@ -97,8 +143,34 @@ pub fn liquid(sim: &mut Simulation, x: usize, y: usize, speed: usize) {
     }
 }
 
-// Future shared behaviours slot in here and get called from a material's
-// `update`, e.g.:
-//
-// /// Gas: the inverse of powder — rise and spread.
-// pub fn gas(sim: &mut Simulation, x: usize, y: usize) { ... }
+/// Gas: the inverse of [`liquid`] — rises, tumbles up-diagonally when blocked,
+/// then drifts sideways along a ceiling. Shared by fire, smoke, steam, …; as
+/// with `liquid`, `speed` is the horizontal flow rate (how far it may drift in
+/// one tick). Movement still goes through `try_move`, so a light gas only rises
+/// through cells it can displace (empty air, by default).
+pub fn gas(sim: &mut Simulation, x: usize, y: usize, speed: usize) {
+    // Straight up (unless against the ceiling).
+    if y > 0 {
+        if sim.try_move(x, y, x, y - 1) {
+            return;
+        }
+        // Up-diagonal. Randomise which side we try first to avoid drift bias.
+        let (first, second): (i32, i32) = if sim.rand_bool() { (-1, 1) } else { (1, -1) };
+        for dx in [first, second] {
+            let nx = x as i32 + dx;
+            if nx >= 0 && (nx as usize) < sim.width && sim.try_move(x, y, nx as usize, y - 1) {
+                return;
+            }
+        }
+    }
+    // Can't rise: drift sideways up to `speed` cells in one random direction.
+    let dir: i32 = if sim.rand_bool() { -1 } else { 1 };
+    let mut cx = x;
+    for _ in 0..speed {
+        let nx = cx as i32 + dir;
+        if nx < 0 || nx as usize >= sim.width || !sim.try_move(cx, y, nx as usize, y) {
+            break;
+        }
+        cx = nx as usize;
+    }
+}
