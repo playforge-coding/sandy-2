@@ -6,8 +6,6 @@ name: Release
 #      archives to the GitHub Release for that tag.
 on:
   push:
-    branches:
-      - main
     tags:
       - "v*"
   workflow_dispatch: {}
