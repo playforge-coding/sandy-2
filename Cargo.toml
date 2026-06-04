@@ -1,0 +1,39 @@
+[package]
+name = "sandy"
+version = "0.1.0"
+edition = "2021"
+description = "A basic but extensible falling-sand simulation (wgpu + custom physics), web & desktop ready."
+
+# Both targets: an rlib so the native binary can link it, and a cdylib so the
+# web build (trunk / wasm-bindgen) has something to load.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# A distinct name from the `sandy` library so the wasm build exposes a single
+# unambiguous artifact (the cdylib) for trunk / wasm-bindgen to load.
+[[bin]]
+name = "sandy-desktop"
+path = "src/main.rs"
+
+[dependencies]
+winit = "0.30.13"
+wgpu = "29.0.3"
+log = "0.4"
+
+# ---- Desktop only ----
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster = "0.4"        # block_on for the async wgpu init on native
+env_logger = "0.11"
+
+# ---- Web only ----
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# `webgl` gives us a fallback for browsers without WebGPU.
+wgpu = { version = "29.0.3", features = ["webgl"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+console_error_panic_hook = "0.1"
+console_log = "1"
+
+[profile.release]
+opt-level = 3
+lto = true

@@ -1,0 +1,130 @@
+name: Release
+
+# Push a version tag (e.g. `git tag v0.1.0 && git push --tags`) to:
+#   1. build the web (wasm) build and publish it to GitHub Pages, and
+#   2. build the native desktop binary for Linux/macOS/Windows and attach the
+#      archives to the GitHub Release for that tag.
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+# `contents: write` lets us create/update the Release; `pages`/`id-token` are
+# required by the Pages deploy action.
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Web: trunk build -> GitHub Pages
+  # --------------------------------------------------------------------------
+  web:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    # Only one Pages deploy at a time; let a newer one supersede an in-flight one.
+    concurrency:
+      group: pages
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (wasm target)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: web
+
+      - name: Install Trunk
+        run: |
+          TRUNK_VERSION=v0.21.14
+          curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xzf- -C "$HOME/.cargo/bin"
+
+      # GitHub Pages project sites are served from /<repo>/, so the asset URLs
+      # in index.html must be prefixed accordingly. trunk also auto-downloads a
+      # matching wasm-bindgen and (for data-wasm-opt) wasm-opt.
+      - name: Build web
+        run: trunk build --release --public-url "/${{ github.event.repository.name }}/"
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
+
+  # --------------------------------------------------------------------------
+  # Desktop: native binary per OS -> attached to the Release
+  # --------------------------------------------------------------------------
+  desktop:
+    # Only build/attach assets for an actual tag (not manual dispatch runs).
+    if: startsWith(github.ref, 'refs/tags/')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build desktop binary
+        run: cargo build --release --bin sandy-desktop --target ${{ matrix.target }}
+
+      # Stage the binary under a versioned name and package it.
+      - name: Package (Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          name="sandy-desktop-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/sandy-desktop" "$name/"
+          cp README.md "$name/"
+          tar -czf "$name.tar.gz" "$name"
+
+      - name: Package (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $name = "sandy-desktop-${{ github.ref_name }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $name | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/sandy-desktop.exe" $name
+          Copy-Item README.md $name
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+
+      - name: Attach to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            sandy-desktop-*.tar.gz
+            sandy-desktop-*.zip
