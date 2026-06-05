@@ -64,13 +64,7 @@ pub fn transform_on_contact(
 /// neighbour (favouring the one above, since most emissions rise) and returns
 /// `true`. Does nothing — and returns `false` — when it doesn't fire or when the
 /// cell is fully boxed in.
-pub fn emit(
-    sim: &mut Simulation,
-    x: usize,
-    y: usize,
-    product: MaterialId,
-    rarity: u32,
-) -> bool {
+pub fn emit(sim: &mut Simulation, x: usize, y: usize, product: MaterialId, rarity: u32) -> bool {
     if !sim.chance(rarity) {
         return false;
     }

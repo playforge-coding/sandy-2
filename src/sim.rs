@@ -24,9 +24,18 @@ struct Cell {
     /// Frozen-at-spawn randomness, used only for colour jitter so a cell's
     /// grain doesn't shimmer as it moves.
     variant: u8,
+    /// Frame on which this cell last moved. The bottom-to-top scan skips a cell
+    /// that already moved this tick, so a particle is processed at most once —
+    /// without this, a *rising* particle (gas/fire) would be re-encountered by
+    /// the same scan in the row above and teleport to the ceiling in one tick.
+    moved: u64,
 }
 
-const VOID: Cell = Cell { mat: EMPTY, variant: 0 };
+const VOID: Cell = Cell {
+    mat: EMPTY,
+    variant: 0,
+    moved: 0,
+};
 
 pub struct Simulation {
     pub width: usize,
@@ -99,6 +108,9 @@ impl Simulation {
 
         if can_move {
             self.cells.swap(si, ti);
+            // The active particle now lives at `ti`; stamp it so this tick's
+            // scan won't process it again (see `Cell::moved`).
+            self.cells[ti].moved = self.frame;
             true
         } else {
             false
@@ -130,7 +142,11 @@ impl Simulation {
     pub(crate) fn set(&mut self, x: usize, y: usize, mat: MaterialId) {
         let variant = (self.rand() & 0xFF) as u8;
         let i = self.idx(x, y);
-        self.cells[i] = Cell { mat, variant };
+        self.cells[i] = Cell {
+            mat,
+            variant,
+            moved: 0,
+        };
     }
 
     /// Stamp a filled circle of `mat` into the grid (the painting brush).
@@ -152,7 +168,11 @@ impl Simulation {
                     self.cells[i] = VOID;
                 } else {
                     let variant = (self.rand() & 0xFF) as u8;
-                    self.cells[i] = Cell { mat, variant };
+                    self.cells[i] = Cell {
+                        mat,
+                        variant,
+                        moved: 0,
+                    };
                 }
             }
         }
@@ -175,10 +195,16 @@ impl Simulation {
             let left_to_right = (self.frame + y as u64) & 1 == 0;
             for xi in 0..w {
                 let x = if left_to_right { xi } else { w - 1 - xi };
-                let id = self.cells[self.idx(x, y)].mat;
-                if id == EMPTY {
+                let cell = self.cells[self.idx(x, y)];
+                if cell.mat == EMPTY {
                     continue;
                 }
+                // Already moved into this row this tick — skip so it isn't
+                // processed twice (keeps rising gas from racing to the top).
+                if cell.moved == self.frame {
+                    continue;
+                }
+                let id = cell.mat;
                 // `get` is 'static and doesn't borrow `self`, so the material is
                 // free to take `&mut self` and move cells around.
                 materials::get(id).update(self, x, y);
@@ -191,7 +217,14 @@ impl Simulation {
     pub fn render_into(&self, buf: &mut [u8]) {
         debug_assert_eq!(buf.len(), self.width * self.height * 4);
         for (i, cell) in self.cells.iter().enumerate() {
-            let rgba = materials::get(cell.mat).info().shade(cell.variant);
+            let info = materials::get(cell.mat).info();
+            let mut rgba = info.shade(cell.variant);
+            // The alpha channel is repurposed as a "this pixel glows" flag for
+            // the renderer's bloom pass: 0 = emissive, 255 = opaque. (We never
+            // alpha-blend the grid texture, so the channel is free to carry
+            // this instead.) The UI overlay always writes 255, so it can't
+            // bloom — see `ui::put`.
+            rgba[3] = if info.glow { 0 } else { 255 };
             buf[i * 4..i * 4 + 4].copy_from_slice(&rgba);
         }
     }
@@ -286,8 +319,37 @@ mod tests {
         sim.set(10, y, OIL);
         sim.set(11, y, LAVA);
         sim.step();
+        // Oil ignites into fire on contact...
         assert_eq!(sim.mat_at(10, y), FIRE);
-        assert_eq!(sim.mat_at(11, y), LAVA);
+        // ...and the lava is not consumed (unlike water+lava→stone). It may
+        // creep a cell sideways on the open floor, so assert it survives
+        // somewhere rather than pinning it to its start cell.
+        assert!(
+            (0..GRID_W).any(|x| sim.mat_at(x, y) == LAVA),
+            "lava should survive lighting the oil"
+        );
+    }
+
+    #[test]
+    fn fire_does_not_teleport_to_the_ceiling() {
+        // Regression: the bottom-to-top scan must process a rising flame at most
+        // once per tick. A whole bottom row of fire should rise exactly one cell
+        // in one step — never jump straight to the top of the grid.
+        let mut sim = Simulation::new();
+        let floor = GRID_H - 1;
+        for x in 0..GRID_W {
+            sim.set(x, floor, FIRE);
+        }
+        sim.step();
+        for x in 0..GRID_W {
+            for y in 0..floor - 1 {
+                assert_ne!(
+                    sim.mat_at(x, y),
+                    FIRE,
+                    "fire rose more than one cell in a single tick"
+                );
+            }
+        }
     }
 
     #[test]
@@ -344,6 +406,9 @@ mod tests {
                 width += 1;
             }
         }
-        assert!(width > 1, "sand should tumble into a pile, got width {width}");
+        assert!(
+            width > 1,
+            "sand should tumble into a pile, got width {width}"
+        );
     }
 }

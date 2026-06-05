@@ -17,6 +17,7 @@ impl Material for Stone {
             jitter: 18,
             density: 255,
             movable: false,
+            glow: false,
         }
     }
 

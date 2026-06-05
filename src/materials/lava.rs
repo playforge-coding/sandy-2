@@ -24,6 +24,7 @@ impl Material for Lava {
             // (150) so sand still sinks through it.
             density: 130,
             movable: true,
+            glow: true,
         }
     }
 

@@ -19,6 +19,7 @@ impl Material for Water {
             // Lighter than sand (150) so sand sinks through it.
             density: 100,
             movable: true,
+            glow: false,
         }
     }
 

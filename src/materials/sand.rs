@@ -18,6 +18,7 @@ impl Material for Sand {
             jitter: 28,
             density: 150,
             movable: true,
+            glow: false,
         }
     }
 

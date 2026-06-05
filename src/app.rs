@@ -11,7 +11,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::gpu::State;
-use crate::materials::{EMPTY, MaterialId};
+use crate::materials::{MaterialId, EMPTY};
 
 /// Delivered once the (async) GPU state has finished initialising. On the web
 /// the device request can't block, so it's built off-thread and handed back
@@ -104,12 +104,7 @@ impl ApplicationHandler<UserEvent> for App {
         self.state = Some(state);
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _id: WindowId,
-        event: WindowEvent,
-    ) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
 
@@ -134,7 +129,11 @@ impl ApplicationHandler<UserEvent> for App {
                 Err(e) => log::error!("failed to load plugin {path:?}: {e}"),
             },
 
-            WindowEvent::MouseInput { state: btn, button: MouseButton::Left, .. } => {
+            WindowEvent::MouseInput {
+                state: btn,
+                button: MouseButton::Left,
+                ..
+            } => {
                 if btn == ElementState::Pressed {
                     // A press on the picker selects a material; anywhere else
                     // starts painting.

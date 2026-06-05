@@ -303,9 +303,13 @@ fn register_host_api(engine: &mut Engine) {
     engine.register_fn("emit", |x: i64, y: i64, product: i64, rarity: i64| {
         with_sim(false, |s| {
             match (cell(x, s.width), cell(y, s.height), valid_mat(product)) {
-                (Some(x), Some(y), Some(product)) => {
-                    behaviors::emit(s, x, y, product, rarity.clamp(1, i64::from(u32::MAX)) as u32)
-                }
+                (Some(x), Some(y), Some(product)) => behaviors::emit(
+                    s,
+                    x,
+                    y,
+                    product,
+                    rarity.clamp(1, i64::from(u32::MAX)) as u32,
+                ),
                 _ => false,
             }
         })
@@ -432,6 +436,12 @@ fn parse_info(map: &Map) -> Result<MaterialInfo, String> {
         .get("movable")
         .and_then(|d| d.as_bool().ok())
         .unwrap_or(true);
+    // Opt-in emissive flag: a plugin can set `glow: true` to get the same bloom
+    // halo the built-in fire and lava have. Defaults off.
+    let glow = map
+        .get("glow")
+        .and_then(|d| d.as_bool().ok())
+        .unwrap_or(false);
 
     Ok(MaterialInfo {
         name,
@@ -439,6 +449,7 @@ fn parse_info(map: &Map) -> Result<MaterialInfo, String> {
         jitter,
         density,
         movable,
+        glow,
     })
 }
 

@@ -17,6 +17,7 @@ impl Material for Empty {
             jitter: 0,
             density: 0,
             movable: false,
+            glow: false,
         }
     }
 

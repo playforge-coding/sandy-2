@@ -21,6 +21,7 @@ impl Material for Oil {
             // Lighter than water (100) so it floats on top of it.
             density: 80,
             movable: true,
+            glow: false,
         }
     }
 

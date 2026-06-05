@@ -64,6 +64,10 @@ pub struct MaterialInfo {
     pub density: u8,
     /// Whether other materials can displace this one (false for solids/air).
     pub movable: bool,
+    /// Whether this material emits light. Glowing cells are flagged for the
+    /// renderer's bloom pass (it gives fire and lava their soft halo); see
+    /// [`crate::sim::Simulation::render_into`] for how the flag is encoded.
+    pub glow: bool,
 }
 
 impl MaterialInfo {

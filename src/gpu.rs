@@ -1,6 +1,13 @@
 //! All wgpu state: device/surface setup, the grid texture, and the per-frame
 //! upload + draw. The physics (in `sim`) is completely GPU-agnostic; this file
-//! just copies the simulation's RGBA buffer into a texture and blits it.
+//! copies the simulation's RGBA buffer into a texture and renders it with a
+//! selective bloom so emissive materials (fire, lava) glow.
+//!
+//! The draw is three fullscreen passes (see `shader.wgsl`): extract+blur the
+//! glowing pixels horizontally into `glow_a`, blur that vertically into
+//! `glow_b`, then composite the crisp grid texture plus the blurred glow to the
+//! window. The glow buffers are kept at the grid resolution (they're tiny and
+//! the halo is soft anyway), so only the surface needs reconfiguring on resize.
 
 use std::sync::Arc;
 
@@ -10,6 +17,9 @@ use crate::materials::MaterialId;
 use crate::sim::{Simulation, GRID_H, GRID_W};
 use crate::ui;
 
+/// How far the glow spreads, in grid texels per blur tap. Larger = wider halo.
+const GLOW_SPREAD: f32 = 1.5;
+
 pub struct State {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -17,14 +27,34 @@ pub struct State {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
 
-    pipeline: wgpu::RenderPipeline,
-    bind_group: wgpu::BindGroup,
+    // Bloom pipeline: extract+blur-h → blur-v → composite.
+    pipeline_blur_h: wgpu::RenderPipeline,
+    pipeline_blur_v: wgpu::RenderPipeline,
+    pipeline_composite: wgpu::RenderPipeline,
+
+    bg_blur_h: wgpu::BindGroup,
+    bg_blur_h_step: wgpu::BindGroup,
+    bg_blur_v: wgpu::BindGroup,
+    bg_blur_v_step: wgpu::BindGroup,
+    bg_composite: wgpu::BindGroup,
+
     grid_texture: wgpu::Texture,
+    // Offscreen render targets for the two blur passes (grid resolution).
+    glow_a_view: wgpu::TextureView,
+    glow_b_view: wgpu::TextureView,
 
     /// CPU-side RGBA scratch buffer, re-filled from the sim every frame.
     pixels: Vec<u8>,
 
     pub sim: Simulation,
+}
+
+/// Pack the 16-byte `Blur` uniform (a per-tap UV offset, padded to vec4).
+fn blur_step_bytes(step_x: f32, step_y: f32) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    b[0..4].copy_from_slice(&step_x.to_le_bytes());
+    b[4..8].copy_from_slice(&step_y.to_le_bytes());
+    b
 }
 
 impl State {
@@ -83,7 +113,8 @@ impl State {
             .find(|f| f.is_srgb())
             .unwrap_or(caps.formats[0]);
         // Match the grid texture's colour space to the surface so the blit is
-        // a 1:1 passthrough.
+        // a 1:1 passthrough. The glow buffers use the same format, so the bloom
+        // maths happen in the same (linear-light, via sRGB) space.
         let tex_format = if format.is_srgb() {
             wgpu::TextureFormat::Rgba8UnormSrgb
         } else {
@@ -102,14 +133,15 @@ impl State {
         };
         surface.configure(&device, &config);
 
-        // ---- The grid texture (one texel per sand cell) ----
+        // ---- Textures: the grid (one texel per cell) and two glow buffers ----
+        let grid_size = wgpu::Extent3d {
+            width: GRID_W as u32,
+            height: GRID_H as u32,
+            depth_or_array_layers: 1,
+        };
         let grid_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("grid"),
-            size: wgpu::Extent3d {
-                width: GRID_W as u32,
-                height: GRID_H as u32,
-                depth_or_array_layers: 1,
-            },
+            size: grid_size,
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -119,7 +151,28 @@ impl State {
         });
         let grid_view = grid_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        // The blur passes ping-pong through these, both sampled and rendered to.
+        let make_glow = |label: &str| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: grid_size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: tex_format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        let glow_a_view = make_glow("glow a");
+        let glow_b_view = make_glow("glow b");
+
+        // Nearest for the crisp grid (and the exact glow mask); linear for the
+        // glow buffers so the halo upsamples smoothly.
+        let nearest = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("nearest"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
@@ -129,33 +182,93 @@ impl State {
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
+        let linear = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("linear"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
 
-        let bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("grid bgl"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
+        // ---- Blur step uniforms (one per direction) ----
+        let blur_h_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("blur h step"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let blur_v_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("blur v step"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(
+            &blur_h_buf,
+            0,
+            &blur_step_bytes(GLOW_SPREAD / GRID_W as f32, 0.0),
+        );
+        queue.write_buffer(
+            &blur_v_buf,
+            0,
+            &blur_step_bytes(0.0, GLOW_SPREAD / GRID_H as f32),
+        );
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("grid bg"),
-            layout: &bind_group_layout,
+        // ---- Bind group layouts ----
+        let tex_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let sampler_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        };
+
+        // group(0) for the blur passes: one input texture + its sampler.
+        let bgl_in = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("blur input bgl"),
+            entries: &[tex_entry(0), sampler_entry(1)],
+        });
+        // group(1): the blur step uniform.
+        let bgl_step = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("blur step bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        // group(0) for the composite: scene texture + sampler, glow texture + sampler.
+        let bgl_composite = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("composite bgl"),
+            entries: &[
+                tex_entry(0),
+                sampler_entry(1),
+                tex_entry(2),
+                sampler_entry(3),
+            ],
+        });
+
+        // ---- Bind groups ----
+        let bg_blur_h = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blur h input"),
+            layout: &bgl_in,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -163,50 +276,123 @@ impl State {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
+                    resource: wgpu::BindingResource::Sampler(&nearest),
+                },
+            ],
+        });
+        let bg_blur_v = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blur v input"),
+            layout: &bgl_in,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&glow_a_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&linear),
+                },
+            ],
+        });
+        let bg_blur_h_step = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blur h step"),
+            layout: &bgl_step,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: blur_h_buf.as_entire_binding(),
+            }],
+        });
+        let bg_blur_v_step = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blur v step"),
+            layout: &bgl_step,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: blur_v_buf.as_entire_binding(),
+            }],
+        });
+        let bg_composite = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("composite"),
+            layout: &bgl_composite,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&grid_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&nearest),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&glow_b_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&linear),
                 },
             ],
         });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("blit shader"),
+            label: Some("bloom shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("blit layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
+        // ---- Pipelines ----
+        let blur_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("blur layout"),
+            bind_group_layouts: &[Some(&bgl_in), Some(&bgl_step)],
+            immediate_size: 0,
+        });
+        let composite_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("composite layout"),
+            bind_group_layouts: &[Some(&bgl_composite)],
             immediate_size: 0,
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("blit pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        // Small helper so the three pipelines only differ by entry point/target.
+        let make_pipeline = |label: &str,
+                             layout: &wgpu::PipelineLayout,
+                             fs_entry: &str,
+                             target: wgpu::TextureFormat| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(fs_entry),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+
+        let pipeline_blur_h = make_pipeline("blur h", &blur_layout, "fs_blur_h", tex_format);
+        let pipeline_blur_v = make_pipeline("blur v", &blur_layout, "fs_blur_v", tex_format);
+        let pipeline_composite = make_pipeline(
+            "composite",
+            &composite_layout,
+            "fs_composite",
+            config.format,
+        );
 
         let sim = Simulation::new();
         let pixels = vec![0u8; GRID_W * GRID_H * 4];
@@ -217,9 +403,17 @@ impl State {
             device,
             queue,
             config,
-            pipeline,
-            bind_group,
+            pipeline_blur_h,
+            pipeline_blur_v,
+            pipeline_composite,
+            bg_blur_h,
+            bg_blur_h_step,
+            bg_blur_v,
+            bg_blur_v_step,
+            bg_composite,
             grid_texture,
+            glow_a_view,
+            glow_b_view,
             pixels,
             sim,
         }
@@ -280,7 +474,7 @@ impl State {
         );
     }
 
-    /// Draw the grid texture to the window.
+    /// Draw the grid texture to the window, blooming the emissive cells.
     pub fn render(&mut self) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
@@ -303,11 +497,19 @@ impl State {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame encoder"),
             });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("blit pass"),
+
+        // Small helper: a single fullscreen pass into `target` with `pipeline`
+        // and the given bind groups (group 1 is optional).
+        let pass = |encoder: &mut wgpu::CommandEncoder,
+                    label: &str,
+                    target: &wgpu::TextureView,
+                    pipeline: &wgpu::RenderPipeline,
+                    bg0: &wgpu::BindGroup,
+                    bg1: Option<&wgpu::BindGroup>| {
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(label),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: target,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
@@ -320,10 +522,41 @@ impl State {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.draw(0..3, 0..1);
-        }
+            rp.set_pipeline(pipeline);
+            rp.set_bind_group(0, bg0, &[]);
+            if let Some(bg1) = bg1 {
+                rp.set_bind_group(1, bg1, &[]);
+            }
+            rp.draw(0..3, 0..1);
+        };
+
+        // 1. Extract glowing pixels + horizontal blur → glow_a.
+        pass(
+            &mut encoder,
+            "blur h pass",
+            &self.glow_a_view,
+            &self.pipeline_blur_h,
+            &self.bg_blur_h,
+            Some(&self.bg_blur_h_step),
+        );
+        // 2. Vertical blur → glow_b.
+        pass(
+            &mut encoder,
+            "blur v pass",
+            &self.glow_b_view,
+            &self.pipeline_blur_v,
+            &self.bg_blur_v,
+            Some(&self.bg_blur_v_step),
+        );
+        // 3. Composite the crisp scene + blurred glow → window.
+        pass(
+            &mut encoder,
+            "composite pass",
+            &view,
+            &self.pipeline_composite,
+            &self.bg_composite,
+            None,
+        );
 
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
