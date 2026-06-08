@@ -4,7 +4,7 @@
 //! - `behaviors`  — shared movement logic materials reuse (falling, piling, …).
 //! - `sim`        — the grid and the tick loop.
 //! - `gpu`        — wgpu setup and per-frame rendering.
-//! - `ui`         — pixel-art overlay (the material picker), drawn into the buffer.
+//! - `ui`         — the egui control panel (material picker, brush, seed).
 //! - `plugin`     — sandboxed Rhai scripts that add new materials at runtime.
 //! - `worldgen`   — seed-based terrain/tree generation (FastNoise Lite).
 //! - `app`        — winit window/input/event loop.

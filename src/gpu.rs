@@ -13,9 +13,7 @@ use std::sync::Arc;
 
 use winit::window::Window;
 
-use crate::materials::MaterialId;
 use crate::sim::{Simulation, GRID_H, GRID_W};
-use crate::ui;
 
 /// How far the glow spreads, in grid texels per blur tap. Larger = wider halo.
 const GLOW_SPREAD: f32 = 1.5;
@@ -45,6 +43,10 @@ pub struct State {
 
     /// CPU-side RGBA scratch buffer, re-filled from the sim every frame.
     pixels: Vec<u8>,
+
+    /// egui's wgpu backend — turns the tessellated UI into draw calls layered
+    /// over the composited scene each frame (see [`State::render`]).
+    egui_renderer: egui_wgpu::Renderer,
 
     pub sim: Simulation,
 }
@@ -394,6 +396,14 @@ impl State {
             config.format,
         );
 
+        // egui paints into the surface format, in its own pass after the bloom
+        // composite. Defaults are fine: no MSAA, no depth, feathered AA on.
+        let egui_renderer = egui_wgpu::Renderer::new(
+            &device,
+            config.format,
+            egui_wgpu::RendererOptions::default(),
+        );
+
         // Open onto a freshly-generated world rather than an empty grid.
         let mut sim = Simulation::new();
         crate::worldgen::generate(&mut sim, crate::worldgen::DEFAULT_SEED);
@@ -417,12 +427,25 @@ impl State {
             glow_a_view,
             glow_b_view,
             pixels,
+            egui_renderer,
             sim,
         }
     }
 
     pub fn window(&self) -> &Window {
         &self.window
+    }
+
+    /// A cloned handle to the window, for callers (e.g. egui input plumbing in
+    /// `app`) that need to hold it past a borrow of `self`.
+    pub fn window_arc(&self) -> Arc<Window> {
+        self.window.clone()
+    }
+
+    /// The device's maximum 2D texture dimension — egui clamps its font/image
+    /// atlas to this.
+    pub fn max_texture_side(&self) -> usize {
+        self.device.limits().max_texture_dimension_2d as usize
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -441,21 +464,12 @@ impl State {
         (gx, gy)
     }
 
-    /// If `pos` (physical window pixels) lands on the material picker, return
-    /// the material that row selects — so the caller can pick instead of paint.
-    pub fn picker_at(&self, pos: (f64, f64)) -> Option<MaterialId> {
-        let (gx, gy) = self.cursor_to_grid(pos);
-        ui::hit_test(gx, gy)
-    }
-
-    /// Advance the simulation one tick, draw the UI overlay, and upload the
-    /// result to the GPU. `selected` is the active material, shown highlighted
-    /// in the picker; `seed`/`editing_seed` drive the seed readout below it.
-    pub fn update(&mut self, selected: MaterialId, seed: u32, editing_seed: bool) {
+    /// Advance the simulation one tick and upload the rendered grid to the GPU.
+    /// The UI is no longer stamped into the pixel buffer — egui draws it as a
+    /// separate pass in [`State::render`].
+    pub fn update(&mut self) {
         self.sim.step();
         self.sim.render_into(&mut self.pixels);
-        ui::draw_picker(&mut self.pixels, selected);
-        ui::draw_seed(&mut self.pixels, seed, editing_seed);
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.grid_texture,
@@ -477,8 +491,16 @@ impl State {
         );
     }
 
-    /// Draw the grid texture to the window, blooming the emissive cells.
-    pub fn render(&mut self) {
+    /// Draw the grid texture to the window, blooming the emissive cells, then
+    /// layer the egui interface on top. `paint_jobs`/`textures_delta` come from
+    /// `egui::Context::tessellate`/`run` (driven in `app`); `pixels_per_point`
+    /// is the display scale egui laid the UI out at.
+    pub fn render(
+        &mut self,
+        paint_jobs: Vec<egui::ClippedPrimitive>,
+        textures_delta: egui::TexturesDelta,
+        pixels_per_point: f32,
+    ) {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
@@ -561,7 +583,57 @@ impl State {
             None,
         );
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        // 4. egui on top, loading (not clearing) the composited scene.
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.config.width, self.config.height],
+            pixels_per_point,
+        };
+        for (id, delta) in &textures_delta.set {
+            self.egui_renderer
+                .update_texture(&self.device, &self.queue, *id, delta);
+        }
+        let user_cmd_bufs = self.egui_renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &paint_jobs,
+            &screen,
+        );
+        {
+            // egui's renderer wants a 'static pass; `forget_lifetime` detaches
+            // it from the borrow of `view`, which outlives the pass anyway.
+            let mut rp = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("egui pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                })
+                .forget_lifetime();
+            self.egui_renderer.render(&mut rp, &paint_jobs, &screen);
+        }
+
+        self.queue.submit(
+            user_cmd_bufs
+                .into_iter()
+                .chain(std::iter::once(encoder.finish())),
+        );
         frame.present();
+
+        // Free any textures egui retired this frame (after submit, so they
+        // aren't dropped while still referenced by in-flight commands).
+        for id in &textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
     }
 }

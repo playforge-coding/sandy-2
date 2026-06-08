@@ -1,6 +1,11 @@
 //! Windowing, input, and the event loop — the glue between winit, the GPU
-//! state, and the simulation. Identical code path on desktop and web; only the
-//! async device-init handoff differs (see `resumed`).
+//! state, egui, and the simulation. Identical code path on desktop and web;
+//! only the async device-init handoff differs (see `resumed`).
+//!
+//! Window events are offered to egui first; whatever it doesn't consume (clicks
+//! outside the panel, un-focused key presses) drives painting and the keyboard
+//! shortcuts. Each redraw runs egui, steps the sim, and hands the tessellated UI
+//! to [`State::render`] to layer over the scene.
 
 use std::sync::Arc;
 
@@ -11,7 +16,8 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::gpu::State;
-use crate::materials::{MaterialId, EMPTY};
+use crate::materials::EMPTY;
+use crate::ui;
 
 /// Delivered once the (async) GPU state has finished initialising. On the web
 /// the device request can't block, so it's built off-thread and handed back
@@ -21,32 +27,21 @@ pub enum UserEvent {
     StateReady(State),
 }
 
-/// Current painting state driven by keyboard/mouse.
+/// Mouse/keyboard painting state, plus the egui-shared [`ui::Controls`]
+/// (selected material, brush size, seed) that the panel and the keyboard
+/// shortcuts both drive.
 struct Input {
     cursor: (f64, f64),
     drawing: bool,
-    material: MaterialId,
-    brush: i32,
-    /// The world seed the next `G`/regenerate uses, and is shown in the UI.
-    seed: u32,
-    /// While true, digit keys type into the seed (instead of selecting a
-    /// material); `Enter` commits and regenerates, `Esc` cancels.
-    editing_seed: bool,
+    controls: ui::Controls,
 }
-
-/// Longest seed the user can type — keeps the readout inside its panel and the
-/// value comfortably within `u32`.
-const MAX_SEED_DIGITS: usize = 7;
 
 impl Default for Input {
     fn default() -> Self {
         Self {
             cursor: (0.0, 0.0),
             drawing: false,
-            material: 1, // Sand
-            brush: 4,
-            seed: crate::worldgen::DEFAULT_SEED as u32,
-            editing_seed: false,
+            controls: ui::Controls::default(),
         }
     }
 }
@@ -57,6 +52,11 @@ struct App {
     proxy: EventLoopProxy<UserEvent>,
     state: Option<State>,
     input: Input,
+    /// egui's persistent context (fonts, memory, layout). Cheap to clone — it's
+    /// an `Arc` inside — so we hand clones to per-frame work freely.
+    egui_ctx: egui::Context,
+    /// Per-window egui input translation; built once the window exists.
+    egui_state: Option<egui_winit::State>,
 }
 
 impl App {
@@ -65,7 +65,28 @@ impl App {
             proxy,
             state: None,
             input: Input::default(),
+            egui_ctx: egui::Context::default(),
+            egui_state: None,
         }
+    }
+
+    /// Build the egui ↔ winit bridge once the GPU state (and thus the window)
+    /// is ready. Idempotent: a no-op if already built or the window isn't up.
+    fn ensure_egui(&mut self) {
+        if self.egui_state.is_some() {
+            return;
+        }
+        let Some(state) = &self.state else {
+            return;
+        };
+        self.egui_state = Some(egui_winit::State::new(
+            self.egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            state.window(),
+            Some(state.window().scale_factor() as f32),
+            None,
+            Some(state.max_texture_side()),
+        ));
     }
 }
 
@@ -97,6 +118,7 @@ impl ApplicationHandler<UserEvent> for App {
             // Native: just block until the GPU is ready.
             let state = pollster::block_on(State::new(window));
             self.state = Some(state);
+            self.ensure_egui();
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -111,11 +133,24 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         let UserEvent::StateReady(state) = event;
-        state.window().request_redraw();
         self.state = Some(state);
+        self.ensure_egui();
+        if let Some(state) = &self.state {
+            state.window().request_redraw();
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // Offer the event to egui first; `consumed` means it landed on the UI
+        // (a click on the panel, typing into the seed box) and shouldn't also
+        // paint or trigger a shortcut.
+        let consumed = match (&self.state, &mut self.egui_state) {
+            (Some(state), Some(egui_state)) => {
+                egui_state.on_window_event(state.window(), &event).consumed
+            }
+            _ => false,
+        };
+
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
 
@@ -135,7 +170,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::DroppedFile(path) => match crate::plugin::load_path(&path) {
                 Ok(id) => {
                     log::info!("loaded plugin material {id} from {path:?}");
-                    self.input.material = id;
+                    self.input.controls.material = id;
                 }
                 Err(e) => log::error!("failed to load plugin {path:?}: {e}"),
             },
@@ -146,39 +181,24 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } => {
                 if btn == ElementState::Pressed {
-                    // A press on the picker selects a material; anywhere else
-                    // starts painting.
-                    let cursor = self.input.cursor;
-                    match self.state.as_ref().and_then(|s| s.picker_at(cursor)) {
-                        Some(material) => self.input.material = material,
-                        None => self.input.drawing = true,
-                    }
+                    // Start painting only if egui didn't take the click.
+                    self.input.drawing = !consumed;
                 } else {
                     self.input.drawing = false;
                 }
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == ElementState::Pressed {
+                // Skip shortcuts while egui wants the key (e.g. the seed box has
+                // focus, so digits type a seed instead of selecting a material).
+                if !consumed && event.state == ElementState::Pressed {
                     if let PhysicalKey::Code(code) = event.physical_key {
                         self.handle_key(code);
                     }
                 }
             }
 
-            WindowEvent::RedrawRequested => {
-                if let Some(state) = &mut self.state {
-                    // Paint under the cursor while the mouse is held.
-                    if self.input.drawing {
-                        let (gx, gy) = state.cursor_to_grid(self.input.cursor);
-                        state
-                            .sim
-                            .paint_disk(gx, gy, self.input.brush, self.input.material);
-                    }
-                    state.update(self.input.material, self.input.seed, self.input.editing_seed);
-                    state.render();
-                }
-            }
+            WindowEvent::RedrawRequested => self.redraw(),
 
             _ => {}
         }
@@ -193,29 +213,84 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 impl App {
-    fn handle_key(&mut self, code: KeyCode) {
-        // While typing a seed, digit keys feed the seed field rather than
-        // selecting a material — so handle that mode separately.
-        if self.input.editing_seed {
-            self.handle_seed_key(code);
+    /// One frame: paint under the cursor, run egui, step the sim, and draw the
+    /// scene with the UI on top.
+    fn redraw(&mut self) {
+        if self.state.is_none() || self.egui_state.is_none() {
             return;
         }
+
+        // Paint under the cursor while the mouse is held.
+        if self.input.drawing {
+            let brush = self.input.controls.brush;
+            let material = self.input.controls.material;
+            let state = self.state.as_mut().unwrap();
+            let (gx, gy) = state.cursor_to_grid(self.input.cursor);
+            state.sim.paint_disk(gx, gy, brush, material);
+        }
+
+        // Run egui for this frame. The window handle is cloned so it doesn't tie
+        // up a borrow of `self.state` while we later mutate it.
+        let window = self.state.as_ref().unwrap().window_arc();
+        let raw_input = self.egui_state.as_mut().unwrap().take_egui_input(&window);
+        let ctx = self.egui_ctx.clone();
+        let mut actions = ui::Actions::default();
+        let full_output = ctx.run(raw_input, |ctx| {
+            actions = ui::draw(ctx, &mut self.input.controls);
+        });
+        self.egui_state
+            .as_mut()
+            .unwrap()
+            .handle_platform_output(&window, full_output.platform_output);
+        let paint_jobs = ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+
+        // Apply any world-gen requests from the panel buttons.
+        self.apply_actions(&actions);
+
+        // Step the sim and draw the scene + UI.
+        if let Some(state) = &mut self.state {
+            state.update();
+            state.render(
+                paint_jobs,
+                full_output.textures_delta,
+                full_output.pixels_per_point,
+            );
+        }
+    }
+
+    /// Carry out the world-generation buttons the panel reported this frame.
+    fn apply_actions(&mut self, actions: &ui::Actions) {
+        if actions.clear {
+            if let Some(state) = &mut self.state {
+                state.sim.clear();
+            }
+        }
+        if actions.generate {
+            self.regenerate();
+        }
+        if actions.randomize {
+            self.randomize_seed();
+        }
+    }
+
+    fn handle_key(&mut self, code: KeyCode) {
+        let c = &mut self.input.controls;
         match code {
             // Material selection. These ids match the registry order in
             // `materials::builtins`.
-            KeyCode::Digit1 => self.input.material = 1, // Sand
-            KeyCode::Digit2 => self.input.material = 2, // Stone
-            KeyCode::Digit3 => self.input.material = 3, // Water
-            KeyCode::Digit4 => self.input.material = 4, // Lava
-            KeyCode::Digit5 => self.input.material = 5, // Oil
-            KeyCode::Digit6 => self.input.material = 6, // Fire
-            KeyCode::Digit7 => self.input.material = 7, // Soil
-            KeyCode::Digit8 => self.input.material = 8, // Wood
-            KeyCode::Digit9 => self.input.material = 9, // Leaves
-            KeyCode::Digit0 | KeyCode::Backspace => self.input.material = EMPTY, // Eraser
+            KeyCode::Digit1 => c.material = 1, // Sand
+            KeyCode::Digit2 => c.material = 2, // Stone
+            KeyCode::Digit3 => c.material = 3, // Water
+            KeyCode::Digit4 => c.material = 4, // Lava
+            KeyCode::Digit5 => c.material = 5, // Oil
+            KeyCode::Digit6 => c.material = 6, // Fire
+            KeyCode::Digit7 => c.material = 7, // Soil
+            KeyCode::Digit8 => c.material = 8, // Wood
+            KeyCode::Digit9 => c.material = 9, // Leaves
+            KeyCode::Digit0 | KeyCode::Backspace => c.material = EMPTY, // Eraser
             // Brush size.
-            KeyCode::BracketLeft => self.input.brush = (self.input.brush - 1).max(0),
-            KeyCode::BracketRight => self.input.brush = (self.input.brush + 1).min(40),
+            KeyCode::BracketLeft => c.brush = (c.brush - 1).max(0),
+            KeyCode::BracketRight => c.brush = (c.brush + 1).min(40),
             // Clear the world.
             KeyCode::KeyC => {
                 if let Some(state) = &mut self.state {
@@ -223,39 +298,8 @@ impl App {
                 }
             }
             // World generation.
-            KeyCode::KeyG => self.regenerate(),        // (re)generate with current seed
-            KeyCode::KeyR => self.randomize_seed(),    // pick a new random seed + generate
-            KeyCode::KeyS => self.input.editing_seed = true, // start typing a seed
-            _ => {}
-        }
-    }
-
-    /// Key handling while the seed field is being edited.
-    fn handle_seed_key(&mut self, code: KeyCode) {
-        if let Some(d) = digit_of(code) {
-            // Build up the seed digit by digit, capped so it stays in-panel.
-            let mut s = self.input.seed.to_string();
-            if s == "0" {
-                s.clear(); // don't keep a leading zero
-            }
-            if s.len() < MAX_SEED_DIGITS {
-                s.push(char::from(b'0' + d as u8));
-                self.input.seed = s.parse().unwrap_or(0);
-            }
-            return;
-        }
-        match code {
-            // Delete the last digit.
-            KeyCode::Backspace => {
-                self.input.seed /= 10;
-            }
-            // Commit the seed and build the world.
-            KeyCode::Enter | KeyCode::NumpadEnter => {
-                self.input.editing_seed = false;
-                self.regenerate();
-            }
-            // Abandon editing, leaving the seed as it was.
-            KeyCode::Escape => self.input.editing_seed = false,
+            KeyCode::KeyG => self.regenerate(), // (re)generate with current seed
+            KeyCode::KeyR => self.randomize_seed(), // pick a new random seed + generate
             _ => {}
         }
     }
@@ -263,37 +307,19 @@ impl App {
     /// Rebuild the world from the current seed.
     fn regenerate(&mut self) {
         if let Some(state) = &mut self.state {
-            crate::worldgen::generate(&mut state.sim, self.input.seed as i32);
+            crate::worldgen::generate(&mut state.sim, self.input.controls.seed_value() as i32);
         }
     }
 
     /// Roll a fresh seed and generate the world it describes.
     fn randomize_seed(&mut self) {
         if let Some(state) = &mut self.state {
-            // Keep it within MAX_SEED_DIGITS so the readout always fits.
+            // Keep it within the seed box's digit cap so the value always fits.
             let seed = state.sim.rand_u32() % 10_000_000;
-            self.input.seed = seed;
+            self.input.controls.set_seed(seed);
             crate::worldgen::generate(&mut state.sim, seed as i32);
         }
     }
-}
-
-/// Map a digit `KeyCode` (top-row or numpad) to its value `0..=9`.
-fn digit_of(code: KeyCode) -> Option<u32> {
-    use KeyCode::*;
-    Some(match code {
-        Digit0 | Numpad0 => 0,
-        Digit1 | Numpad1 => 1,
-        Digit2 | Numpad2 => 2,
-        Digit3 | Numpad3 => 3,
-        Digit4 | Numpad4 => 4,
-        Digit5 | Numpad5 => 5,
-        Digit6 | Numpad6 => 6,
-        Digit7 | Numpad7 => 7,
-        Digit8 | Numpad8 => 8,
-        Digit9 | Numpad9 => 9,
-        _ => return None,
-    })
 }
 
 /// Entry point shared by the desktop binary and the web (wasm) build.
@@ -317,7 +343,7 @@ pub fn run() {
     }
 
     log::info!(
-        "Controls: click the picker (top-left) or 1=Sand 2=Stone 3=Water 4=Lava 5=Oil 6=Fire 7=Soil 8=Wood 9=Leaves  0/Backspace=Erase  [ ]=brush size  C=clear  G=generate world  R=random seed  S=type a seed (digits, Enter to apply, Esc to cancel)  (hold left mouse to draw)  — drag a .rhai file onto the window to add a material"
+        "Controls: use the panel, or press 1=Sand 2=Stone 3=Water 4=Lava 5=Oil 6=Fire 7=Soil 8=Wood 9=Leaves  0/Backspace=Erase  [ ]=brush size  C=clear  G=generate world  R=random seed  (hold left mouse to draw)  — drag a .rhai file onto the window to add a material"
     );
 
     let event_loop = EventLoop::<UserEvent>::with_user_event()

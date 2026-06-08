@@ -20,8 +20,7 @@ use crate::sim::Simulation;
 /// rather than vanishing in a single tick. A smaller `rarity` catches faster
 /// (leaves), a larger one resists longer (wood). Returns `true` if it ignited.
 pub fn flammable(sim: &mut Simulation, x: usize, y: usize, rarity: u32) -> bool {
-    let touched_by_heat =
-        sim.neighbor(x, y, FIRE).is_some() || sim.neighbor(x, y, LAVA).is_some();
+    let touched_by_heat = sim.neighbor(x, y, FIRE).is_some() || sim.neighbor(x, y, LAVA).is_some();
     if touched_by_heat && sim.chance(rarity) {
         sim.set(x, y, FIRE);
         true

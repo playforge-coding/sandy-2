@@ -1,221 +1,135 @@
-//! A tiny immediate-mode overlay drawn straight into the CPU pixel buffer.
+//! The on-screen controls, built with [egui](https://docs.rs/egui) (immediate
+//! mode).
 //!
-//! The renderer scales the `GRID_W × GRID_H` buffer up to the window with
-//! nearest-neighbour filtering, so anything we stamp here shows up as crisp
-//! pixel-art at whatever the current window size is — the same on native and
-//! web, with no extra render pass or text-rendering crate.
-//!
-//! Right now the only widget is the material picker: one row per registered
-//! material showing its average colour and name, with the selected one
-//! highlighted. [`draw_picker`] paints it; [`hit_test`] maps a grid coordinate
-//! back to the material whose row was clicked (or `None` for "not on the UI").
+//! egui renders as its own pass on top of the simulation (see
+//! [`crate::gpu::State::render`]), so — unlike the old hand-rolled overlay that
+//! stamped pixels into the sand buffer — nothing here touches the grid. The
+//! panel is a material picker, a brush-size slider, and seed entry plus
+//! world-generation buttons. Keyboard shortcuts in [`crate::app`] drive the
+//! very same [`Controls`], so the two stay in sync.
+
+use egui::{Color32, RichText, Stroke};
 
 use crate::materials::{self, MaterialId};
-use crate::sim::{GRID_H, GRID_W};
 
-// ---- Layout (all in grid pixels) ----
-const PANEL_X: i32 = 4;
-const PANEL_Y: i32 = 4;
-const PANEL_W: i32 = 46;
-const PAD: i32 = 3;
-const ROW_H: i32 = 12; // row pitch, including the 2px gap below each row
-const ROW_GAP: i32 = 2;
-const SWATCH: i32 = 8;
-/// Vertical gap between the picker panel and the seed panel below it.
-const PANEL_GAP: i32 = 3;
+/// Longest seed the user can type — keeps the value comfortably within `u32`.
+const MAX_SEED_DIGITS: usize = 7;
 
-// ---- Colours ----
-const PANEL_BG: [u8; 4] = [22, 22, 30, 230];
-const ROW_SEL_BG: [u8; 4] = [58, 58, 74, 255];
-const BORDER_SEL: [u8; 4] = [255, 255, 255, 255];
-const SWATCH_BORDER: [u8; 4] = [10, 10, 12, 255];
-const TEXT: [u8; 4] = [220, 220, 228, 255];
-const TEXT_SEL: [u8; 4] = [255, 255, 255, 255];
-
-/// Top-left of the i-th material row, and its drawable height.
-fn row_rect(i: usize) -> (i32, i32, i32, i32) {
-    let top = PANEL_Y + PAD + i as i32 * ROW_H;
-    (PANEL_X, top, PANEL_W, ROW_H - ROW_GAP)
+/// Control state shared between the egui panel and the keyboard shortcuts in
+/// [`crate::app`]. egui reads and writes it in place each frame; `app` pokes the
+/// same fields from key handlers.
+pub struct Controls {
+    /// Material the brush paints with.
+    pub material: MaterialId,
+    /// Brush radius, in grid cells.
+    pub brush: i32,
+    /// The world seed, as text so it can be edited in a box. Parsed to a `u32`
+    /// when a world is actually built (see [`Controls::seed_value`]).
+    pub seed: String,
 }
 
-fn panel_height() -> i32 {
-    PAD * 2 + materials::count() as i32 * ROW_H - ROW_GAP
-}
-
-/// Draw the material picker over `buf` (a tightly-packed `GRID_W*GRID_H*4`
-/// RGBA8 buffer). `selected` is the currently-active material id, drawn
-/// highlighted.
-pub fn draw_picker(buf: &mut [u8], selected: MaterialId) {
-    fill_rect(buf, PANEL_X, PANEL_Y, PANEL_W, panel_height(), PANEL_BG);
-
-    for id in 0..materials::count() {
-        let info = materials::get(id as MaterialId).info();
-        let (rx, ry, rw, rh) = row_rect(id);
-        let is_sel = id as MaterialId == selected;
-
-        if is_sel {
-            fill_rect(buf, rx, ry, rw, rh, ROW_SEL_BG);
-            rect_border(buf, rx, ry, rw, rh, BORDER_SEL);
-        }
-
-        // Colour swatch, vertically centred in the row, with a dark border so a
-        // black/empty swatch still reads as a box against the panel.
-        let sx = rx + PAD;
-        let sy = ry + (rh - SWATCH) / 2;
-        fill_rect(buf, sx, sy, SWATCH, SWATCH, info.average_color());
-        rect_border(buf, sx, sy, SWATCH, SWATCH, SWATCH_BORDER);
-
-        // Name, to the right of the swatch (font is 5px tall → centre it).
-        let tx = sx + SWATCH + PAD;
-        let ty = ry + (rh - FONT_H) / 2;
-        draw_text(buf, tx, ty, info.name, if is_sel { TEXT_SEL } else { TEXT });
-    }
-}
-
-/// Draw the seed readout just below the material picker: a `SEED` label and the
-/// current value. While the user is typing a new seed (`editing` is true) the
-/// value box is highlighted with a border so it's clear input is going there.
-pub fn draw_seed(buf: &mut [u8], seed: u32, editing: bool) {
-    let py = PANEL_Y + panel_height() + PANEL_GAP;
-    let inner_h = FONT_H + 2 + FONT_H; // "SEED" line, gap, value line
-    let h = PAD * 2 + inner_h;
-    fill_rect(buf, PANEL_X, py, PANEL_W, h, PANEL_BG);
-
-    // Label.
-    draw_text(buf, PANEL_X + PAD, py + PAD, "SEED", TEXT);
-
-    // Value, on the line below. Highlight the row while it's being edited.
-    let vy = py + PAD + FONT_H + 2;
-    if editing {
-        fill_rect(buf, PANEL_X + 1, vy - 1, PANEL_W - 2, FONT_H + 2, ROW_SEL_BG);
-        rect_border(buf, PANEL_X + 1, vy - 1, PANEL_W - 2, FONT_H + 2, BORDER_SEL);
-    }
-    let text = seed.to_string();
-    draw_text(
-        buf,
-        PANEL_X + PAD,
-        vy,
-        &text,
-        if editing { TEXT_SEL } else { TEXT },
-    );
-}
-
-/// Map a grid coordinate to the material whose picker row contains it, or
-/// `None` if the point isn't on the picker (so the caller can paint instead).
-pub fn hit_test(gx: i32, gy: i32) -> Option<MaterialId> {
-    for id in 0..materials::count() {
-        let (rx, ry, rw, rh) = row_rect(id);
-        if gx >= rx && gx < rx + rw && gy >= ry && gy < ry + rh {
-            return Some(id as MaterialId);
-        }
-    }
-    None
-}
-
-// ---------------------------------------------------------------------------
-// Pixel-pushing primitives
-// ---------------------------------------------------------------------------
-
-#[inline]
-fn put(buf: &mut [u8], x: i32, y: i32, c: [u8; 4]) {
-    if x < 0 || y < 0 || x >= GRID_W as i32 || y >= GRID_H as i32 {
-        return;
-    }
-    let i = (y as usize * GRID_W + x as usize) * 4;
-    if c[3] == 255 {
-        buf[i..i + 4].copy_from_slice(&c);
-    } else {
-        // Source-over alpha blend, so the semi-transparent panel lets a little
-        // of the simulation show through behind it.
-        let a = c[3] as u32;
-        let ia = 255 - a;
-        for k in 0..3 {
-            buf[i + k] = ((c[k] as u32 * a + buf[i + k] as u32 * ia) / 255) as u8;
-        }
-        buf[i + 3] = 255;
-    }
-}
-
-fn fill_rect(buf: &mut [u8], x: i32, y: i32, w: i32, h: i32, c: [u8; 4]) {
-    for dy in 0..h {
-        for dx in 0..w {
-            put(buf, x + dx, y + dy, c);
+impl Default for Controls {
+    fn default() -> Self {
+        Self {
+            material: 1, // Sand
+            brush: 4,
+            seed: crate::worldgen::DEFAULT_SEED.to_string(),
         }
     }
 }
 
-fn rect_border(buf: &mut [u8], x: i32, y: i32, w: i32, h: i32, c: [u8; 4]) {
-    for dx in 0..w {
-        put(buf, x + dx, y, c);
-        put(buf, x + dx, y + h - 1, c);
+impl Controls {
+    /// The seed as a number (`0` if the box is empty or not a valid `u32`).
+    pub fn seed_value(&self) -> u32 {
+        self.seed.trim().parse().unwrap_or(0)
     }
-    for dy in 0..h {
-        put(buf, x, y + dy, c);
-        put(buf, x + w - 1, y + dy, c);
+
+    /// Replace the seed text (used by the "random seed" shortcut/button).
+    pub fn set_seed(&mut self, seed: u32) {
+        self.seed = seed.to_string();
     }
 }
 
-// ---------------------------------------------------------------------------
-// Minimal 3×5 bitmap font (uppercase A–Z, 0–9, space). Each glyph is 5 rows of
-// 3 bits; bit 0b100 is the left column. Unknown chars render as blank.
-// ---------------------------------------------------------------------------
+/// World-generation requests raised by the panel this frame. The keyboard
+/// shortcuts in [`crate::app`] perform the same actions directly, so this only
+/// carries what the *buttons* asked for.
+#[derive(Default)]
+pub struct Actions {
+    pub clear: bool,
+    pub generate: bool,
+    pub randomize: bool,
+}
 
-const FONT_W: i32 = 3;
-const FONT_H: i32 = 5;
-const GLYPH_ADVANCE: i32 = FONT_W + 1;
+/// Build the control panel for this frame and report which buttons were hit.
+pub fn draw(ctx: &egui::Context, c: &mut Controls) -> Actions {
+    let mut actions = Actions::default();
 
-fn draw_text(buf: &mut [u8], mut x: i32, y: i32, text: &str, c: [u8; 4]) {
-    for ch in text.chars() {
-        let glyph = glyph(ch);
-        for (row, bits) in glyph.iter().enumerate() {
-            for col in 0..FONT_W {
-                if bits & (0b100 >> col) != 0 {
-                    put(buf, x + col, y + row as i32, c);
+    egui::Window::new("Sandy")
+        .default_pos([8.0, 8.0])
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label("Material");
+            for id in 0..materials::count() as MaterialId {
+                let info = materials::get(id).info();
+                let fill = to_color32(info.average_color());
+                let mut btn = egui::Button::new(RichText::new(info.name).color(contrast(fill)))
+                    .fill(fill)
+                    .min_size(egui::vec2(130.0, 18.0));
+                if id == c.material {
+                    btn = btn.stroke(Stroke::new(2.0, Color32::WHITE));
+                }
+                if ui.add(btn).clicked() {
+                    c.material = id;
                 }
             }
-        }
-        x += GLYPH_ADVANCE;
-    }
+
+            ui.separator();
+            ui.add(egui::Slider::new(&mut c.brush, 0..=40).text("Brush"));
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Seed");
+                let edit = egui::TextEdit::singleline(&mut c.seed)
+                    .char_limit(MAX_SEED_DIGITS)
+                    .desired_width(70.0);
+                let resp = ui.add(edit);
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    actions.generate = true;
+                }
+            });
+            // Keep the field numeric so it always parses to a seed.
+            c.seed.retain(|ch| ch.is_ascii_digit());
+
+            ui.horizontal(|ui| {
+                actions.generate |= ui.button("Generate").clicked();
+                actions.randomize |= ui.button("Random").clicked();
+                actions.clear |= ui.button("Clear").clicked();
+            });
+
+            ui.separator();
+            ui.label(
+                RichText::new("Hold left-mouse to draw · drag a .rhai file to add a material")
+                    .small()
+                    .weak(),
+            );
+        });
+
+    actions
 }
 
-fn glyph(ch: char) -> [u8; 5] {
-    match ch.to_ascii_uppercase() {
-        'A' => [0b111, 0b101, 0b111, 0b101, 0b101],
-        'B' => [0b110, 0b101, 0b110, 0b101, 0b110],
-        'C' => [0b011, 0b100, 0b100, 0b100, 0b011],
-        'D' => [0b110, 0b101, 0b101, 0b101, 0b110],
-        'E' => [0b111, 0b100, 0b110, 0b100, 0b111],
-        'F' => [0b111, 0b100, 0b110, 0b100, 0b100],
-        'G' => [0b011, 0b100, 0b101, 0b101, 0b011],
-        'H' => [0b101, 0b101, 0b111, 0b101, 0b101],
-        'I' => [0b111, 0b010, 0b010, 0b010, 0b111],
-        'J' => [0b001, 0b001, 0b001, 0b101, 0b011],
-        'K' => [0b101, 0b110, 0b100, 0b110, 0b101],
-        'L' => [0b100, 0b100, 0b100, 0b100, 0b111],
-        'M' => [0b101, 0b111, 0b111, 0b101, 0b101],
-        'N' => [0b101, 0b111, 0b111, 0b111, 0b101],
-        'O' => [0b111, 0b101, 0b101, 0b101, 0b111],
-        'P' => [0b111, 0b101, 0b111, 0b100, 0b100],
-        'Q' => [0b111, 0b101, 0b101, 0b111, 0b011],
-        'R' => [0b110, 0b101, 0b110, 0b101, 0b101],
-        'S' => [0b111, 0b100, 0b111, 0b001, 0b111],
-        'T' => [0b111, 0b010, 0b010, 0b010, 0b010],
-        'U' => [0b101, 0b101, 0b101, 0b101, 0b111],
-        'V' => [0b101, 0b101, 0b101, 0b101, 0b010],
-        'W' => [0b101, 0b101, 0b111, 0b111, 0b101],
-        'X' => [0b101, 0b101, 0b010, 0b101, 0b101],
-        'Y' => [0b101, 0b101, 0b010, 0b010, 0b010],
-        'Z' => [0b111, 0b001, 0b010, 0b100, 0b111],
-        '0' => [0b111, 0b101, 0b101, 0b101, 0b111],
-        '1' => [0b010, 0b110, 0b010, 0b010, 0b111],
-        '2' => [0b111, 0b001, 0b111, 0b100, 0b111],
-        '3' => [0b111, 0b001, 0b111, 0b001, 0b111],
-        '4' => [0b101, 0b101, 0b111, 0b001, 0b001],
-        '5' => [0b111, 0b100, 0b111, 0b001, 0b111],
-        '6' => [0b111, 0b100, 0b111, 0b101, 0b111],
-        '7' => [0b111, 0b001, 0b010, 0b100, 0b100],
-        '8' => [0b111, 0b101, 0b111, 0b101, 0b111],
-        '9' => [0b111, 0b101, 0b111, 0b001, 0b111],
-        _ => [0, 0, 0, 0, 0], // space and anything unsupported
+/// A material's swatch colour as an opaque egui [`Color32`] (the stored alpha is
+/// the renderer's glow flag, not real transparency, so force it opaque here).
+fn to_color32(c: [u8; 4]) -> Color32 {
+    Color32::from_rgb(c[0], c[1], c[2])
+}
+
+/// Pick black or white text for readability over a swatch colour (Rec. 601
+/// luma).
+fn contrast(c: Color32) -> Color32 {
+    let luma = 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
+    if luma > 140.0 {
+        Color32::BLACK
+    } else {
+        Color32::WHITE
     }
 }

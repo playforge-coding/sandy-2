@@ -138,8 +138,7 @@ fn plant_tree(sim: &mut Simulation, seed: i32, x: usize, surface: usize) {
 /// tree placement/sizing independent of the simulation's RNG. `stream` lets one
 /// column draw several uncorrelated values (placement, height, radius).
 fn hash(seed: i32, x: i64, stream: u64) -> u32 {
-    let mut h = (seed as u32 as u64)
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    let mut h = (seed as u32 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
         ^ (x as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)
         ^ stream.wrapping_mul(0xCA5A_826E_5C9C_7A1F);
     h ^= h >> 33;

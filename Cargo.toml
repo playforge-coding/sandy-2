@@ -20,6 +20,14 @@ winit = "0.30.13"
 wgpu = "29.0.3"
 log = "0.4"
 rhai = "1.25.1"
+# egui drives the on-screen controls (material picker, brush, seed). These
+# versions track wgpu 29 / winit 0.30. `egui-winit` runs with default features
+# off so it doesn't drag in native-only clipboard/x11 deps (notably `arboard`,
+# which won't build for wasm); `egui-wgpu` likewise, to skip the macOS
+# `wgpu/metal` default that the non-Apple builds don't need.
+egui = "0.34"
+egui-wgpu = { version = "0.34", default-features = false }
+egui-winit = { version = "0.34", default-features = false }
 # The Rust port of FastNoise Lite — drives seed-based world generation
 # (terrain heightmap + tree placement). Pure Rust, so it builds on web too.
 fastnoise-lite = "1.1.1"
@@ -33,6 +41,9 @@ env_logger = "0.11"
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # `webgl` gives us a fallback for browsers without WebGPU.
 wgpu = { version = "29.0.3", features = ["webgl"] }
+# wgpu's resources aren't Send/Sync on wasm; this feature lets `egui-wgpu` hold
+# them anyway (safe on the single-threaded web event loop).
+egui-wgpu = { version = "0.34", default-features = false, features = ["fragile-send-sync-non-atomic-wasm"] }
 # Pulled in transitively (ahash -> rhai). On wasm32 getrandom 0.3 needs the
 # `wasm_js` feature *and* the `getrandom_backend="wasm_js"` cfg (see
 # .cargo/config.toml) to use the browser's crypto.getRandomValues.
