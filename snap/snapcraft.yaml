@@ -1,0 +1,54 @@
+name: sandy
+base: core22
+summary: A basic but extensible falling-sand simulation
+description: |
+  Sandy is a falling-sand simulation built with wgpu and a custom physics
+  engine. Paint with different materials, watch them flow, burn, and settle.
+
+# `version` is set at build time from the git tag (see the `sandy` part's
+# override-pull below), so the snap version always matches the release.
+adopt-info: sandy
+
+grade: stable
+confinement: strict
+
+# Build for the architectures GitHub-hosted runners (and snapcraft remote
+# build) can produce.
+architectures:
+  - build-on: amd64
+
+apps:
+  sandy:
+    command: bin/sandy-desktop
+    # The gnome extension wires up the GTK/GL runtime, themes, fonts and the
+    # desktop/wayland/x11 plugs that a wgpu + winit GUI needs.
+    extensions: [gnome]
+    plugs:
+      - opengl
+      - wayland
+      - x11
+
+parts:
+  sandy:
+    plugin: rust
+    source: .
+    # `cargo install` builds the package's binary (sandy-desktop) for the host
+    # target; the cdylib/rlib lib targets are skipped.
+    rust-channel: stable
+    override-pull: |
+      craftctl default
+      # Strip the leading `v` from tags like `v0.1.0`; fall back to the short
+      # commit when building off a non-tag ref.
+      version="$(git describe --tags --always 2>/dev/null | sed 's/^v//')"
+      craftctl set version="${version:-0.0.0}"
+    build-packages:
+      - libx11-dev
+      - libxkbcommon-dev
+      - libwayland-dev
+      - libxcursor-dev
+      - libxi-dev
+      - libxrandr-dev
+    stage-packages:
+      - libxkbcommon0
+      - libvulkan1
+      - mesa-vulkan-drivers
