@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1e2a44"/>
+      <stop offset="1" stop-color="#0e1525"/>
+    </linearGradient>
+    <linearGradient id="sand" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f4d28c"/>
+      <stop offset="1" stop-color="#c98f3a"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="40" fill="url(#sky)"/>
+  <!-- sand pile -->
+  <path d="M40 216 Q128 120 216 216 Z" fill="url(#sand)"/>
+  <!-- falling grains -->
+</svg>

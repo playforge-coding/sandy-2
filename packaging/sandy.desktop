@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Sandy
+GenericName=Falling-Sand Simulation
+Comment=A basic but extensible falling-sand simulation
+Exec=sandy-desktop
+Icon=sandy
+Terminal=false
+Categories=Game;Simulation;
+Keywords=sand;simulation;physics;cellular;automata;

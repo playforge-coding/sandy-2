@@ -128,30 +128,39 @@ jobs:
             sandy-desktop-*.zip
 
   # --------------------------------------------------------------------------
-  # Snap: build the snap and publish it to the Snap Store
+  # Debian: build a .deb (binary + desktop file + icon) -> attached to the Release
   # --------------------------------------------------------------------------
-  # Requires a SNAPCRAFT_STORE_CREDENTIALS repository secret, generated with:
-  #   snapcraft export-login --snaps=sandy \
-  #     --acls package_access,package_push,package_update,package_release -
-  snap:
-    # Only publish for an actual tag (not manual dispatch runs).
+  deb:
+    # Only build/attach for an actual tag (not manual dispatch runs).
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          # snapcraft derives the snap version from `git describe --tags`, so we
-          # need the tags (and history) available in the checkout.
-          fetch-depth: 0
 
-      - name: Build snap
-        id: build
-        uses: snapcore/action-build@v1
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
 
-      - name: Publish to the Snap Store
-        uses: snapcore/action-publish@v1
-        env:
-          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+      - uses: Swatinem/rust-cache@v2
         with:
-          snap: ${{ steps.build.outputs.snap }}
-          release: stable
+          key: deb
+
+      # GUI/windowing build deps so the desktop binary links.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev libxkbcommon-dev libwayland-dev \
+            libxcursor-dev libxi-dev libxrandr-dev
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+
+      # cargo-deb reads [package.metadata.deb] in Cargo.toml; the package
+      # version comes from the crate version there.
+      - name: Build .deb
+        run: cargo deb --output sandy_${{ github.ref_name }}_amd64.deb
+
+      - name: Attach to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: sandy_*.deb

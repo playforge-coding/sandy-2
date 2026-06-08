@@ -3,6 +3,7 @@ name = "sandy"
 version = "0.1.0"
 edition = "2021"
 description = "A basic but extensible falling-sand simulation (wgpu + custom physics), web & desktop ready."
+license = "AGPL-3.0-only"
 
 # Both targets: an rlib so the native binary can link it, and a cdylib so the
 # web build (trunk / wasm-bindgen) has something to load.
@@ -56,3 +57,25 @@ console_log = "1"
 [profile.release]
 opt-level = 3
 lto = true
+
+# ---- Debian packaging (cargo-deb) ----
+# `cargo deb` reads this to build a .deb. Shared-library dependencies (libx11,
+# libxkbcommon, libwayland, ...) are derived automatically from the binary via
+# dpkg-shlibdeps; the Vulkan ICD drivers below are dlopen'd at runtime, so they
+# have to be listed by hand.
+[package.metadata.deb]
+name = "sandy"
+maintainer = "Oliver"
+section = "games"
+priority = "optional"
+# Pulls in a working Vulkan loader + Mesa drivers so wgpu has a GPU backend.
+depends = "$auto, libvulkan1, mesa-vulkan-drivers"
+extended-description = """\
+Sandy is a falling-sand simulation built with wgpu and a custom physics \
+engine. Paint with different materials, watch them flow, burn, and settle."""
+assets = [
+    ["target/release/sandy-desktop", "usr/bin/", "755"],
+    ["packaging/sandy.desktop", "usr/share/applications/", "644"],
+    ["packaging/sandy.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["README.md", "usr/share/doc/sandy/README.md", "644"],
+]
