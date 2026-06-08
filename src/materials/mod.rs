@@ -28,10 +28,13 @@
 mod empty;
 mod fire;
 mod lava;
+mod leaves;
 mod oil;
 mod sand;
+mod soil;
 mod stone;
 mod water;
+mod wood;
 
 use std::cell::RefCell;
 
@@ -50,6 +53,10 @@ pub const WATER: MaterialId = 3;
 pub const LAVA: MaterialId = 4;
 pub const OIL: MaterialId = 5;
 pub const FIRE: MaterialId = 6;
+/// Terrain materials, used by the world generator (`crate::worldgen`).
+pub const SOIL: MaterialId = 7;
+pub const WOOD: MaterialId = 8;
+pub const LEAVES: MaterialId = 9;
 
 /// A material's static, render- and physics-relevant properties.
 #[derive(Clone, Copy)]
@@ -126,7 +133,12 @@ fn builtins() -> Vec<&'static dyn Material> {
     static LAVA: lava::Lava = lava::Lava; // id 4
     static OIL: oil::Oil = oil::Oil; // id 5
     static FIRE: fire::Fire = fire::Fire; // id 6
-    vec![&EMPTY, &SAND, &STONE, &WATER, &LAVA, &OIL, &FIRE]
+    static SOIL: soil::Soil = soil::Soil; // id 7
+    static WOOD: wood::Wood = wood::Wood; // id 8
+    static LEAVES: leaves::Leaves = leaves::Leaves; // id 9
+    vec![
+        &EMPTY, &SAND, &STONE, &WATER, &LAVA, &OIL, &FIRE, &SOIL, &WOOD, &LEAVES,
+    ]
 }
 
 thread_local! {

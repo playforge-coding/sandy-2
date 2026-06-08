@@ -20,6 +20,9 @@ winit = "0.30.13"
 wgpu = "29.0.3"
 log = "0.4"
 rhai = "1.25.1"
+# The Rust port of FastNoise Lite — drives seed-based world generation
+# (terrain heightmap + tree placement). Pure Rust, so it builds on web too.
+fastnoise-lite = "1.1.1"
 
 # ---- Desktop only ----
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

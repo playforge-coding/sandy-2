@@ -9,8 +9,26 @@
 //! (`try_move`, `rand_bool`, …) and never touch material-specific data, so any
 //! material can call any of them.
 
-use crate::materials::{MaterialId, EMPTY};
+use crate::materials::{MaterialId, EMPTY, FIRE, LAVA};
 use crate::sim::Simulation;
+
+/// Catch fire from an adjacent flame or lava, turning this cell into [`FIRE`].
+///
+/// A combustible solid (wood, leaves) calls this before its normal "do nothing"
+/// motion. The ignition is stochastic — with probability `1/rarity` per tick
+/// while a flame or lava touches it — so a tree burns down as a creeping front
+/// rather than vanishing in a single tick. A smaller `rarity` catches faster
+/// (leaves), a larger one resists longer (wood). Returns `true` if it ignited.
+pub fn flammable(sim: &mut Simulation, x: usize, y: usize, rarity: u32) -> bool {
+    let touched_by_heat =
+        sim.neighbor(x, y, FIRE).is_some() || sim.neighbor(x, y, LAVA).is_some();
+    if touched_by_heat && sim.chance(rarity) {
+        sim.set(x, y, FIRE);
+        true
+    } else {
+        false
+    }
+}
 
 /// React on contact: if any neighbour of `(x,y)` is `trigger`, turn both this
 /// cell and that neighbour into `product` and report that a reaction happened.

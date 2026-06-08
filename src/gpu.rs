@@ -394,7 +394,9 @@ impl State {
             config.format,
         );
 
-        let sim = Simulation::new();
+        // Open onto a freshly-generated world rather than an empty grid.
+        let mut sim = Simulation::new();
+        crate::worldgen::generate(&mut sim, crate::worldgen::DEFAULT_SEED);
         let pixels = vec![0u8; GRID_W * GRID_H * 4];
 
         State {
@@ -448,11 +450,12 @@ impl State {
 
     /// Advance the simulation one tick, draw the UI overlay, and upload the
     /// result to the GPU. `selected` is the active material, shown highlighted
-    /// in the picker.
-    pub fn update(&mut self, selected: MaterialId) {
+    /// in the picker; `seed`/`editing_seed` drive the seed readout below it.
+    pub fn update(&mut self, selected: MaterialId, seed: u32, editing_seed: bool) {
         self.sim.step();
         self.sim.render_into(&mut self.pixels);
         ui::draw_picker(&mut self.pixels, selected);
+        ui::draw_seed(&mut self.pixels, seed, editing_seed);
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.grid_texture,

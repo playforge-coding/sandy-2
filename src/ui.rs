@@ -21,6 +21,8 @@ const PAD: i32 = 3;
 const ROW_H: i32 = 12; // row pitch, including the 2px gap below each row
 const ROW_GAP: i32 = 2;
 const SWATCH: i32 = 8;
+/// Vertical gap between the picker panel and the seed panel below it.
+const PANEL_GAP: i32 = 3;
 
 // ---- Colours ----
 const PANEL_BG: [u8; 4] = [22, 22, 30, 230];
@@ -68,6 +70,34 @@ pub fn draw_picker(buf: &mut [u8], selected: MaterialId) {
         let ty = ry + (rh - FONT_H) / 2;
         draw_text(buf, tx, ty, info.name, if is_sel { TEXT_SEL } else { TEXT });
     }
+}
+
+/// Draw the seed readout just below the material picker: a `SEED` label and the
+/// current value. While the user is typing a new seed (`editing` is true) the
+/// value box is highlighted with a border so it's clear input is going there.
+pub fn draw_seed(buf: &mut [u8], seed: u32, editing: bool) {
+    let py = PANEL_Y + panel_height() + PANEL_GAP;
+    let inner_h = FONT_H + 2 + FONT_H; // "SEED" line, gap, value line
+    let h = PAD * 2 + inner_h;
+    fill_rect(buf, PANEL_X, py, PANEL_W, h, PANEL_BG);
+
+    // Label.
+    draw_text(buf, PANEL_X + PAD, py + PAD, "SEED", TEXT);
+
+    // Value, on the line below. Highlight the row while it's being edited.
+    let vy = py + PAD + FONT_H + 2;
+    if editing {
+        fill_rect(buf, PANEL_X + 1, vy - 1, PANEL_W - 2, FONT_H + 2, ROW_SEL_BG);
+        rect_border(buf, PANEL_X + 1, vy - 1, PANEL_W - 2, FONT_H + 2, BORDER_SEL);
+    }
+    let text = seed.to_string();
+    draw_text(
+        buf,
+        PANEL_X + PAD,
+        vy,
+        &text,
+        if editing { TEXT_SEL } else { TEXT },
+    );
 }
 
 /// Map a grid coordinate to the material whose picker row contains it, or

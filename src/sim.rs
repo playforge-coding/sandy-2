@@ -80,6 +80,14 @@ impl Simulation {
         self.rand() & 1 == 0
     }
 
+    /// A fresh pseudo-random `u32`. Used to mint a random world seed when the
+    /// user asks for one (the "randomise" key), so each press lands on a
+    /// different world without needing a system clock (handy on the web).
+    #[inline]
+    pub(crate) fn rand_u32(&mut self) -> u32 {
+        self.rand()
+    }
+
     /// True with probability `1/n` — a rarity dial for stochastic behaviours
     /// (fire guttering out, lava spitting a flame). `n == 0` is treated as `1`
     /// (always true) so callers needn't guard against it.

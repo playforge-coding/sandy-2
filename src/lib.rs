@@ -6,6 +6,7 @@
 //! - `gpu`        — wgpu setup and per-frame rendering.
 //! - `ui`         — pixel-art overlay (the material picker), drawn into the buffer.
 //! - `plugin`     — sandboxed Rhai scripts that add new materials at runtime.
+//! - `worldgen`   — seed-based terrain/tree generation (FastNoise Lite).
 //! - `app`        — winit window/input/event loop.
 
 mod app;
@@ -15,6 +16,7 @@ mod materials;
 mod plugin;
 mod sim;
 mod ui;
+mod worldgen;
 
 pub use app::run;
 
