@@ -49,7 +49,10 @@ egui-wgpu = { version = "0.34", default-features = false, features = ["fragile-s
 # `wasm_js` feature *and* the `getrandom_backend="wasm_js"` cfg (see
 # .cargo/config.toml) to use the browser's crypto.getRandomValues.
 getrandom = { version = "0.3", features = ["wasm_js"] }
-wasm-bindgen = "0.2"
+# Pinned: trunk downloads the matching wasm-bindgen-cli prebuilt binary, and
+# 0.2.123 is on crates.io but has no GitHub release archive yet (404). Bump this
+# only once the corresponding release exists at rustwasm/wasm-bindgen/releases.
+wasm-bindgen = "=0.2.122"
 wasm-bindgen-futures = "0.4"
 console_error_panic_hook = "0.1"
 console_log = "1"
