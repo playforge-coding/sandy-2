@@ -37,6 +37,11 @@ const VOID: Cell = Cell {
     moved: 0,
 };
 
+/// How many ticks the wind blows one way before it reverses. At roughly 60
+/// ticks a second (the redraw loop in `crate::app`), this is about half a
+/// minute — long enough that a gust feels like weather rather than a flicker.
+const WIND_PERIOD: u64 = 1800;
+
 pub struct Simulation {
     pub width: usize,
     pub height: usize,
@@ -44,6 +49,11 @@ pub struct Simulation {
     frame: u64,
     /// xorshift state for cheap, dependency-free randomness.
     rng: u32,
+    /// Prevailing wind direction: `-1` blows left, `+1` blows right. It flips
+    /// every [`WIND_PERIOD`] ticks — the whole "wind system" is just this one
+    /// variable getting negated on a timer (see [`Simulation::step`]). Clouds
+    /// read it to decide which way to drift.
+    wind: i32,
 }
 
 impl Simulation {
@@ -54,7 +64,15 @@ impl Simulation {
             cells: vec![VOID; GRID_W * GRID_H],
             frame: 0,
             rng: 0x9E37_79B9,
+            wind: 1,
         }
+    }
+
+    /// The current prevailing wind direction (`-1` left, `+1` right). Materials
+    /// that drift on the wind (clouds) read this each tick.
+    #[inline]
+    pub(crate) fn wind(&self) -> i32 {
+        self.wind
     }
 
     #[inline]
@@ -195,6 +213,10 @@ impl Simulation {
     /// Advance the world by one tick.
     pub fn step(&mut self) {
         self.frame = self.frame.wrapping_add(1);
+        // The entire wind system: reverse direction once per period.
+        if self.frame % WIND_PERIOD == 0 {
+            self.wind = -self.wind;
+        }
         let (w, h) = (self.width, self.height);
 
         // Bottom row first so settled particles don't get re-processed.

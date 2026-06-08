@@ -2,12 +2,31 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Lock the viewport to the device so the canvas maps 1:1 and double-tap /
+       pinch don't zoom the page out from under the simulation. -->
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
   <title>Sandy — falling sand</title>
   <style>
-    html, body { margin: 0; height: 100%; background: #111; overflow: hidden; }
+    html, body { margin: 0; width: 100%; height: 100%; background: #111; overflow: hidden; }
     body { display: flex; align-items: center; justify-content: center; }
-    canvas { display: block; image-rendering: pixelated; outline: none; }
+    /* winit sizes the canvas with an inline (non-`!important`) style; these
+       `!important` rules win, so the canvas always fills the viewport. winit's
+       ResizeObserver then sees the real device-pixel size, resizes the drawing
+       buffer to match, and emits a `Resized` event (handled in `app.rs`) — so
+       the sim stays sharp and responsive across rotation and window resizes. */
+    canvas {
+      display: block;
+      image-rendering: pixelated;
+      outline: none;
+      width: 100% !important;
+      height: 100% !important;
+      /* Touch drives painting, so stop the browser from scrolling/zooming on it. */
+      touch-action: none;
+      -webkit-user-select: none;
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
   </style>
   <!-- Trunk builds the crate's cdylib and injects the wasm loader here.
        data-target-name selects the `sandy` library artifact (the desktop

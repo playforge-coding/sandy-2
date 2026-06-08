@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, MouseButton, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
@@ -185,6 +185,20 @@ impl ApplicationHandler<UserEvent> for App {
                     self.input.drawing = !consumed;
                 } else {
                     self.input.drawing = false;
+                }
+            }
+
+            // Touch (mobile / touchscreens) paints just like the mouse. The
+            // location rides on the event itself rather than arriving as a
+            // separate `CursorMoved`, so update the cursor here. egui sees the
+            // touch first; `consumed` means it landed on the panel, so — as with
+            // a click — we don't also start painting.
+            WindowEvent::Touch(touch) => {
+                self.input.cursor = (touch.location.x, touch.location.y);
+                match touch.phase {
+                    TouchPhase::Started => self.input.drawing = !consumed,
+                    TouchPhase::Moved => {} // keep painting; cursor already updated
+                    TouchPhase::Ended | TouchPhase::Cancelled => self.input.drawing = false,
                 }
             }
 

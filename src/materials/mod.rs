@@ -25,15 +25,19 @@
 //! `ui`, and `gpu` only ever go through [`get`]/[`count`] and never learn which
 //! is which.
 
+mod cloud;
 mod empty;
 mod fire;
 mod lava;
 mod leaves;
 mod oil;
+mod rain;
 mod sand;
+mod seeds;
 mod soil;
 mod stone;
 mod water;
+mod wet_soil;
 mod wood;
 
 use std::cell::RefCell;
@@ -57,6 +61,12 @@ pub const FIRE: MaterialId = 6;
 pub const SOIL: MaterialId = 7;
 pub const WOOD: MaterialId = 8;
 pub const LEAVES: MaterialId = 9;
+/// Weather + growth materials. Clouds rain; rain wets soil; seeds sprout trees
+/// from wet soil. See the matching files for the reaction chain.
+pub const CLOUD: MaterialId = 10;
+pub const RAIN: MaterialId = 11;
+pub const WET_SOIL: MaterialId = 12;
+pub const SEEDS: MaterialId = 13;
 
 /// A material's static, render- and physics-relevant properties.
 #[derive(Clone, Copy)]
@@ -118,6 +128,15 @@ pub trait Material {
     /// Advance a single cell of this material by one tick. Should delegate to
     /// a shared helper in [`crate::behaviors`].
     fn update(&self, sim: &mut Simulation, x: usize, y: usize);
+
+    /// Whether this material appears in the on-screen material picker (and is
+    /// thus paintable by hand). Almost everything does; the exception is a
+    /// material that only ever exists because *another* material spawns it —
+    /// rain, which falls from clouds — so it has no business in the palette.
+    /// Defaults to `true`, so a normal material needn't think about it.
+    fn pickable(&self) -> bool {
+        true
+    }
 }
 
 /// ===================== ADD NEW BUILT-IN MATERIALS HERE =====================
@@ -136,8 +155,13 @@ fn builtins() -> Vec<&'static dyn Material> {
     static SOIL: soil::Soil = soil::Soil; // id 7
     static WOOD: wood::Wood = wood::Wood; // id 8
     static LEAVES: leaves::Leaves = leaves::Leaves; // id 9
+    static CLOUD: cloud::Cloud = cloud::Cloud; // id 10
+    static RAIN: rain::Rain = rain::Rain; // id 11
+    static WET_SOIL: wet_soil::WetSoil = wet_soil::WetSoil; // id 12
+    static SEEDS: seeds::Seeds = seeds::Seeds; // id 13
     vec![
-        &EMPTY, &SAND, &STONE, &WATER, &LAVA, &OIL, &FIRE, &SOIL, &WOOD, &LEAVES,
+        &EMPTY, &SAND, &STONE, &WATER, &LAVA, &OIL, &FIRE, &SOIL, &WOOD, &LEAVES, &CLOUD, &RAIN,
+        &WET_SOIL, &SEEDS,
     ]
 }
 

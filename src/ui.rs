@@ -64,17 +64,40 @@ pub struct Actions {
 pub fn draw(ctx: &egui::Context, c: &mut Controls) -> Actions {
     let mut actions = Actions::default();
 
+    // On a narrow viewport (phones) lay the panel out for fingertips: bigger
+    // touch targets and a wider, fixed panel so buttons don't shrink to a
+    // hairline. On a roomy desktop window, keep the original compact layout.
+    let compact = ctx.screen_rect().width() < 550.0;
+    let button_size = if compact {
+        egui::vec2(200.0, 38.0)
+    } else {
+        egui::vec2(130.0, 18.0)
+    };
+
     egui::Window::new("Sandy")
         .default_pos([8.0, 8.0])
         .resizable(false)
         .show(ctx, |ui| {
+            if compact {
+                // Roomier spacing and taller sliders/text fields for touch.
+                let s = ui.spacing_mut();
+                s.interact_size.y = 32.0;
+                s.item_spacing = egui::vec2(8.0, 8.0);
+                s.slider_width = 160.0;
+            }
+
             ui.label("Material");
             for id in 0..materials::count() as MaterialId {
-                let info = materials::get(id).info();
+                let mat = materials::get(id);
+                // Some materials (rain) are spawned by others and never painted.
+                if !mat.pickable() {
+                    continue;
+                }
+                let info = mat.info();
                 let fill = to_color32(info.average_color());
                 let mut btn = egui::Button::new(RichText::new(info.name).color(contrast(fill)))
                     .fill(fill)
-                    .min_size(egui::vec2(130.0, 18.0));
+                    .min_size(button_size);
                 if id == c.material {
                     btn = btn.stroke(Stroke::new(2.0, Color32::WHITE));
                 }
