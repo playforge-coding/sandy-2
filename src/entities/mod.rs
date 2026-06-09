@@ -29,6 +29,7 @@
 mod ant;
 mod behaviors;
 mod bird;
+mod fish;
 
 use std::cell::RefCell;
 
@@ -43,6 +44,7 @@ pub type EntityKindId = u8;
 /// world generator). Must match the positions in [`builtins`].
 pub const ANT: EntityKindId = 0;
 pub const BIRD: EntityKindId = 1;
+pub const FISH: EntityKindId = 2;
 
 /// A creature kind's static, render-relevant properties — the entity cousin of
 /// [`crate::materials::MaterialInfo`].
@@ -90,6 +92,11 @@ pub struct EntityState {
     /// it climbs all the way to starvation. Creatures with no appetite simply
     /// never consult it.
     pub hunger: u16,
+    /// Ticks a water creature has spent out of water — climbing while it's in the
+    /// air (a fish that beached itself, or is mid-leap) and reset the moment it's
+    /// back under. A swimmer suffocates if it stays out too long; land and air
+    /// creatures never touch it. See [`behaviors::swim`].
+    pub air: u16,
     /// Cleared by a behaviour to have the creature reaped at the end of the tick
     /// (an ant that wandered into water drowns, or one that starved).
     pub alive: bool,
@@ -107,6 +114,7 @@ impl EntityState {
             dir,
             timer: 0,
             hunger: 0,
+            air: 0,
             alive: true,
         }
     }
@@ -132,7 +140,8 @@ pub trait Entity {
 fn builtins() -> Vec<&'static dyn Entity> {
     static ANT: ant::Ant = ant::Ant; // id 0
     static BIRD: bird::Bird = bird::Bird; // id 1
-    vec![&ANT, &BIRD]
+    static FISH: fish::Fish = fish::Fish; // id 2
+    vec![&ANT, &BIRD, &FISH]
 }
 
 thread_local! {

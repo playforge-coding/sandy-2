@@ -16,10 +16,13 @@ pub struct Ant;
 /// A three-pixel speck — a body with a head in front — dark against the terrain.
 const SPRITE: &[(i8, i8)] = &[(0, 0), (1, 0), (0, -1)];
 
-/// Ants are grazers: they browse leaves and prey on nothing.
+/// Ants are grazers: they browse leaves and prey on nothing, sniffing out a patch
+/// only within a short range so they graze nearby rather than roam.
 const DIET: behaviors::Diet = behaviors::Diet {
     plants: &[LEAVES],
     prey: &[],
+    plant_sense: 16,
+    prey_sense: 0.0,
 };
 
 impl Entity for Ant {

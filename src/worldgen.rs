@@ -18,8 +18,8 @@
 
 use fastnoise_lite::{FastNoiseLite, FractalType, NoiseType};
 
-use crate::entities::{ANT, BIRD};
-use crate::materials::{EMPTY, LEAVES, SOIL, STONE, WATER, WOOD};
+use crate::entities::{ANT, BIRD, FISH};
+use crate::materials::{ALGAE, EMPTY, LEAVES, SOIL, STONE, WATER, WOOD};
 use crate::sim::Simulation;
 
 /// The seed the world opens with before the user picks their own.
@@ -36,6 +36,16 @@ const ANT_RARITY: u32 = 40;
 
 /// How many birds wheel over a freshly-generated world.
 const BIRD_COUNT: u64 = 5;
+
+/// Roughly one in this many submerged columns sprouts a tuft of algae on its bed.
+const ALGAE_RARITY: u32 = 5;
+
+/// Roughly one in this many submerged columns starts with a fish in it.
+const FISH_RARITY: u32 = 22;
+
+/// A column needs at least this much water depth to seed a fish, so they start
+/// with room to swim rather than wedged into a shallow puddle.
+const FISH_MIN_DEPTH: usize = 8;
 
 /// Build and paint a complete world for `seed`, replacing whatever was there.
 pub fn generate(sim: &mut Simulation, seed: i32) {
@@ -75,6 +85,22 @@ pub fn generate(sim: &mut Simulation, seed: i32) {
         plant_tree(sim, seed, x, top);
     }
 
+    // ---- Algae ----
+    // A few tufts on the bed of any deep-enough pool, in the water just above the
+    // seabed, so newly-spawned fish have something to graze. It creeps from there.
+    for x in 0..w {
+        let top = surface[x];
+        let submerged = top > sea_level;
+        if !submerged || hash(seed, x as i64, 5) % ALGAE_RARITY != 0 {
+            continue;
+        }
+        // The water cell sitting just above the seabed.
+        let bed = top - 1;
+        if bed >= sea_level {
+            sim.set(x, bed, ALGAE);
+        }
+    }
+
     // ---- Creatures ----
     // A scattering of ants ambling on the dry ground and a few birds aloft, so a
     // freshly-generated world already has some life in it. (Placement is seeded
@@ -92,6 +118,17 @@ pub fn generate(sim: &mut Simulation, seed: i32) {
         let bx = (w as u64 * (2 * b + 1) / (2 * BIRD_COUNT)) as i32;
         let by = (h as f32 * 0.18) as i32 + (hash(seed, b as i64, 4) % 20) as i32;
         sim.spawn_entity(BIRD, bx, by);
+    }
+    // Fish in the deeper pools, set partway down the water column so they begin
+    // comfortably submerged.
+    for x in 0..w {
+        let top = surface[x];
+        let deep_enough = top > sea_level + FISH_MIN_DEPTH;
+        if !deep_enough || hash(seed, x as i64, 6) % FISH_RARITY != 0 {
+            continue;
+        }
+        let fy = (sea_level + top) / 2;
+        sim.spawn_entity(FISH, x as i32, fy as i32);
     }
 }
 

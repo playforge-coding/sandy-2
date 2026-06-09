@@ -10,7 +10,7 @@
 //! behaviours use (`cell_mat`, `chance`, `rand_f32`), so they never need to know
 //! how the grid is stored.
 
-use crate::materials::{MaterialId, EMPTY, LAVA, OIL, WATER};
+use crate::materials::{MaterialId, ALGAE, EMPTY, LAVA, OIL, WATER};
 use crate::sim::Simulation;
 
 use super::{EntityKindId, EntityState};
@@ -153,6 +153,11 @@ pub fn fly(sim: &mut Simulation, me: &mut EntityState) {
 /// creature kinds it can hunt (a bird on [`ANT`](crate::entities::ANT)). Either
 /// list may be empty — a pure grazer has no `prey`, a pure predator no `plants`.
 ///
+/// The `prey` list is **priority-ordered**: a hunter goes for the first kind it
+/// can find, only falling back to later kinds when none is in range. A bird that
+/// lists `[FISH, ANT]` thus always stoops on a fish it can see in preference to
+/// any ant. Prey is in turn preferred over plants (a creature is the bigger meal).
+///
 /// A creature must **never** list its own kind in `prey`: a hunter senses prey
 /// through the live entity list, where it still appears as a stale copy of itself
 /// while it thinks (see [`crate::sim::Simulation::step_entities`]), so it would
@@ -160,8 +165,14 @@ pub fn fly(sim: &mut Simulation, me: &mut EntityState) {
 pub struct Diet {
     /// Terrain materials this creature grazes, cleared to air when eaten.
     pub plants: &'static [MaterialId],
-    /// Creature kinds this creature preys on, reaped when eaten.
+    /// Creature kinds this creature preys on, in priority order, reaped when eaten.
     pub prey: &'static [EntityKindId],
+    /// How far this creature can smell out a plant patch, in cells. Short keeps a
+    /// grazer browsing what's around it rather than marching across the world.
+    pub plant_sense: i32,
+    /// How far this creature can *see* prey, in cells. A high-flying hunter sees a
+    /// long way (and stoops from afar); an ambusher only senses prey close by.
+    pub prey_sense: f32,
 }
 
 /// Hunger gained per tick a creature goes unfed.
@@ -170,12 +181,6 @@ const HUNGER_PER_TICK: u16 = 1;
 const HUNGRY: u16 = 120;
 /// Once hunger reaches this, the creature has starved and is reaped.
 const STARVING: u16 = 2000;
-/// How far a grazer can smell out a patch of plants, in cells — short range, so
-/// it browses what's around it rather than marching across the world.
-const PLANT_SENSE_RADIUS: i32 = 16;
-/// How far a hunter can *see* prey, in cells — long range, so a bird wheeling
-/// high in the sky can spot an ant on the ground far below and stoop on it.
-const PREY_SENSE_RADIUS: f32 = 240.0;
 /// How near food must be for [`eat`] to reach it, in cells (a little over a
 /// cell's diagonal, so anything orthogonally or diagonally adjacent counts).
 const EAT_REACH: f32 = 2.5;
@@ -204,31 +209,27 @@ fn hunger_tick(me: &mut EntityState) -> bool {
 /// nothing itself, leaving the forager to decide how to act on the bearing. The
 /// "search for food" primitive, shared by every forager.
 pub fn search(sim: &Simulation, me: &EntityState, diet: &Diet) -> Option<(f32, f32)> {
-    let prey = if diet.prey.is_empty() {
-        None
-    } else {
-        sim.nearest_entity(me.x, me.y, diet.prey, PREY_SENSE_RADIUS)
+    // Prey first, in priority order: the nearest of the highest-priority kind that
+    // has anything in range wins, so a bird eyeing both a fish and an ant goes for
+    // the fish (see [`Diet`]).
+    let prey = diet.prey.iter().find_map(|&kind| {
+        sim.nearest_entity(me.x, me.y, &[kind], diet.prey_sense)
             .map(|(_, dx, dy)| (dx, dy))
-    };
-    let plant = if diet.plants.is_empty() {
-        None
-    } else {
-        sim.nearest_cell(
-            me.x.round() as i32,
-            me.y.round() as i32,
-            diet.plants,
-            PLANT_SENSE_RADIUS,
-        )
-        .map(|(cx, cy)| (cx as f32 - me.x, cy as f32 - me.y))
-    };
-
-    // Chase whichever is nearer when both are in range.
-    match (prey, plant) {
-        (Some(p), Some(q)) => Some(if mag2(p) <= mag2(q) { p } else { q }),
-        (Some(p), None) => Some(p),
-        (None, Some(q)) => Some(q),
-        (None, None) => None,
+    });
+    if prey.is_some() {
+        return prey;
     }
+    // No prey about: head for the nearest plant patch instead.
+    if diet.plants.is_empty() {
+        return None;
+    }
+    sim.nearest_cell(
+        me.x.round() as i32,
+        me.y.round() as i32,
+        diet.plants,
+        diet.plant_sense,
+    )
+    .map(|(cx, cy)| (cx as f32 - me.x, cy as f32 - me.y))
 }
 
 /// Eat any food within [`EAT_REACH`]: a prey creature is reaped, or an adjacent
@@ -237,8 +238,9 @@ pub fn search(sim: &Simulation, me: &EntityState, diet: &Diet) -> Option<(f32, f
 /// neighbour in place rather than moving. Prey is preferred over plants when both
 /// are in reach (a creature is the bigger meal).
 pub fn eat(sim: &mut Simulation, me: &mut EntityState, diet: &Diet) -> bool {
-    if !diet.prey.is_empty() {
-        if let Some((i, _, _)) = sim.nearest_entity(me.x, me.y, diet.prey, EAT_REACH) {
+    // Prey in priority order — snatch the highest-priority kind within reach.
+    for &kind in diet.prey {
+        if let Some((i, _, _)) = sim.nearest_entity(me.x, me.y, &[kind], EAT_REACH) {
             sim.reap_entity(i);
             me.hunger = 0;
             return true;
@@ -253,8 +255,13 @@ pub fn eat(sim: &mut Simulation, me: &mut EntityState, diet: &Diet) -> bool {
             if cx < 0 || cy < 0 || cx as usize >= sim.width || cy as usize >= sim.height {
                 continue;
             }
-            if diet.plants.contains(&sim.mat_at(cx as usize, cy as usize)) {
-                sim.set(cx as usize, cy as usize, EMPTY);
+            let m = sim.mat_at(cx as usize, cy as usize);
+            if diet.plants.contains(&m) {
+                // Aquatic plants grow *in* water, so grazing one leaves the water
+                // it stood in behind — not an air pocket the grazer would then
+                // "drown" out of. Land plants just leave bare air.
+                let left = if m == ALGAE { WATER } else { EMPTY };
+                sim.set(cx as usize, cy as usize, left);
                 me.hunger = 0;
                 return true;
             }
@@ -355,7 +362,177 @@ fn dive(sim: &mut Simulation, me: &mut EntityState, dx: f32, dy: f32) {
     me.y = (me.y + me.vy).clamp(1.0, (sim.height - 2) as f32);
 }
 
-/// Squared magnitude of a 2-D offset — for comparing distances without a `sqrt`.
-fn mag2((x, y): (f32, f32)) -> f32 {
-    x * x + y * y
+// ───────────────────────────── swimming ──────────────────────────────
+//
+// A swimmer's world is the water: it must stay submerged to breathe, so its
+// motion ([`paddle`]) keeps it under the surface and off the bottom and turns it
+// back at the bank. The forager [`swim`] folds in the usual hunger/eat/breed, and
+// adds the one trick a fish has that a walker or flier doesn't — when it senses
+// prey up out of the water (an ant on the bank) it lines up beneath it and
+// [leaps](pursue) clear of the surface to grab it.
+
+/// Cruising speed of a fish, in cells/tick.
+const SWIM_SPEED: f32 = 0.9;
+/// Gravity on a fish once it's out of the water (mid-leap or beached).
+const FISH_GRAVITY: f32 = 0.5;
+/// Upward speed of a breaching leap — enough to clear the surface and reach an
+/// ant standing on the bank just above it.
+const LEAP_SPEED: f32 = 2.2;
+/// Horizontal drift a fish manages while airborne (it has little purchase on air).
+const AIR_DRIFT: f32 = 0.5;
+/// Ticks a fish can survive out of water before it suffocates — comfortably more
+/// than a leap takes, so only a properly beached fish dies of it.
+const SWIM_SUFFOCATE: u16 = 70;
+
+/// Whether a cell is water a fish can swim through — open water or the algae that
+/// grows in it.
+fn aquatic(sim: &Simulation, x: i32, y: i32) -> bool {
+    matches!(sim.cell_mat(x, y), Some(WATER) | Some(ALGAE))
+}
+
+/// Nudge a swimmer's vertical velocity to keep it in the water: don't rise out
+/// through the surface, and lift off the bottom when terrain is right below.
+fn keep_submerged(sim: &Simulation, me: &mut EntityState, x: i32, y: i32) {
+    if !aquatic(sim, x, y - 1) {
+        me.vy = me.vy.max(0.0); // open air just above — stay under the surface
+    }
+    if !aquatic(sim, x, y + 1) {
+        me.vy = -(SWIM_SPEED * 0.5); // bottom just below — rise off it
+    }
+}
+
+/// A fish that isn't in the water: count down to suffocation while it falls back
+/// toward the pool under gravity, drifting `drift_dx`-ward (toward the prey it
+/// leapt for, if any). Comes to rest flopping if it lands on solid ground.
+fn airborne(sim: &mut Simulation, me: &mut EntityState, drift_dx: f32) {
+    me.air = me.air.saturating_add(1);
+    if me.air >= SWIM_SUFFOCATE {
+        me.alive = false;
+        return;
+    }
+    me.timer = me.timer.wrapping_add(1);
+    me.vy = (me.vy + FISH_GRAVITY).min(2.5);
+
+    let (x, y) = (me.x.round() as i32, me.y.round() as i32);
+    if drift_dx.abs() > 0.5 {
+        me.dir = if drift_dx > 0.0 { 1 } else { -1 };
+    }
+    let nx = me.x + me.dir as f32 * AIR_DRIFT;
+    let ahead = nx.round() as i32;
+    if nx > 1.0 && nx < (sim.width - 1) as f32 && !solid(sim, ahead, y) {
+        me.x = nx;
+    }
+    // Sink unless solid ground catches the flop.
+    let ny = me.y + me.vy;
+    if !solid(sim, x, ny.round() as i32) {
+        me.y = ny.clamp(1.0, (sim.height - 2) as f32);
+    } else {
+        me.vy = 0.0;
+    }
+}
+
+/// Swim about within the water: cruise in the facing direction, wander gently up
+/// and down, hold below the surface and above the bottom, and turn back at the
+/// bank. Counts toward suffocation (and falls back toward the pool) whenever it
+/// finds itself out of water. Shared by fish and any future swimmer.
+pub fn paddle(sim: &mut Simulation, me: &mut EntityState) {
+    let (x, y) = (me.x.round() as i32, me.y.round() as i32);
+    if !aquatic(sim, x, y) {
+        airborne(sim, me, 0.0);
+        return;
+    }
+    me.air = 0;
+    me.timer = me.timer.wrapping_add(1);
+    if me.vx == 0.0 {
+        me.vx = me.dir as f32 * SWIM_SPEED;
+    }
+    if sim.chance(12) {
+        me.vy += sim.rand_f32() - 0.5;
+    }
+    me.vy = (me.vy * 0.85).clamp(-SWIM_SPEED, SWIM_SPEED);
+    keep_submerged(sim, me, x, y);
+
+    let nx = me.x + me.vx;
+    let ahead = nx.round() as i32;
+    if nx < 1.0 || nx >= (sim.width - 1) as f32 || !aquatic(sim, ahead, y) {
+        me.vx = -me.vx;
+        me.dir = -me.dir;
+    } else {
+        me.x = nx;
+    }
+    me.y = (me.y + me.vy).clamp(1.0, (sim.height - 2) as f32);
+}
+
+/// A swimming forager: paddle about until hunger bites, then feed — eat any food
+/// within reach (and maybe breed), else make for what it senses. Algae and prey
+/// down in the water it simply swims to; an ant up on the bank it stalks to the
+/// surface and leaps at. Suffocates if stranded out of water, starves if unfed.
+/// Shared by fish and any future swimmer.
+pub fn swim(sim: &mut Simulation, me: &mut EntityState, diet: &Diet) {
+    if hunger_tick(me) {
+        return;
+    }
+    if me.hunger >= HUNGRY {
+        if eat(sim, me, diet) {
+            breed(sim, me);
+            return;
+        }
+        if let Some((dx, dy)) = search(sim, me, diet) {
+            pursue(sim, me, dx, dy);
+            return;
+        }
+    }
+    paddle(sim, me);
+}
+
+/// Make for food at offset `(dx, dy)`: swim straight to it when it's in the water,
+/// but when it's an ant up above the surface, rise to just under it and — once
+/// lined up — breach in a leap to snatch it (gravity, via [`airborne`], splashing
+/// the fish back down after). A focused counterpart to [`paddle`] used mid-chase.
+fn pursue(sim: &mut Simulation, me: &mut EntityState, dx: f32, dy: f32) {
+    let (x, y) = (me.x.round() as i32, me.y.round() as i32);
+    // Already out of the water — mid-leap (or chasing across the surface): coast
+    // under gravity, steering toward the prey.
+    if !aquatic(sim, x, y) {
+        airborne(sim, me, dx);
+        return;
+    }
+    me.air = 0;
+    me.timer = me.timer.wrapping_add(1);
+    if dx.abs() > 0.5 {
+        me.dir = if dx > 0.0 { 1 } else { -1 };
+    }
+
+    let prey_above = dy < -0.5;
+    let lined_up = dx.abs() <= 1.5;
+    let at_surface = !aquatic(sim, x, y - 1);
+
+    // Lined up just under the surface with prey above: breach!
+    if prey_above && lined_up && at_surface {
+        me.vx = 0.0;
+        me.vy = -LEAP_SPEED;
+        me.y += me.vy; // commit the leap clear of the water this tick
+        return;
+    }
+
+    // Otherwise swim toward the food, rising toward the surface when the prey is
+    // above so the next breach launches from just beneath it.
+    me.vx = me.dir as f32 * SWIM_SPEED;
+    me.vy = if prey_above {
+        -(SWIM_SPEED * 0.6)
+    } else {
+        dy.clamp(-SWIM_SPEED, SWIM_SPEED)
+    };
+    keep_submerged(sim, me, x, y);
+
+    // Follow only through water; bounce at the bank rather than beaching itself.
+    let nx = me.x + me.vx;
+    let ahead = nx.round() as i32;
+    if nx > 1.0 && nx < (sim.width - 1) as f32 && aquatic(sim, ahead, y) {
+        me.x = nx;
+    } else {
+        me.vx = -me.vx;
+        me.dir = -me.dir;
+    }
+    me.y = (me.y + me.vy).clamp(1.0, (sim.height - 2) as f32);
 }

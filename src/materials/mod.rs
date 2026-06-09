@@ -25,6 +25,7 @@
 //! `ui`, and `gpu` only ever go through [`get`]/[`count`] and never learn which
 //! is which.
 
+mod algae;
 mod cloud;
 mod empty;
 mod fire;
@@ -70,6 +71,8 @@ pub const WET_SOIL: MaterialId = 12;
 pub const SEEDS: MaterialId = 13;
 /// Summoned by the Meteor tool; explodes into fire and lava on impact.
 pub const METEOR: MaterialId = 14;
+/// An aquatic plant that creeps through water — the food fish graze on.
+pub const ALGAE: MaterialId = 15;
 
 /// A material's static, render- and physics-relevant properties.
 #[derive(Clone, Copy)]
@@ -163,9 +166,10 @@ fn builtins() -> Vec<&'static dyn Material> {
     static WET_SOIL: wet_soil::WetSoil = wet_soil::WetSoil; // id 12
     static SEEDS: seeds::Seeds = seeds::Seeds; // id 13
     static METEOR: meteor::Meteor = meteor::Meteor; // id 14
+    static ALGAE: algae::Algae = algae::Algae; // id 15
     vec![
         &EMPTY, &SAND, &STONE, &WATER, &LAVA, &OIL, &FIRE, &SOIL, &WOOD, &LEAVES, &CLOUD, &RAIN,
-        &WET_SOIL, &SEEDS, &METEOR,
+        &WET_SOIL, &SEEDS, &METEOR, &ALGAE,
     ]
 }
 

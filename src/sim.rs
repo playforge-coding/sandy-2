@@ -560,6 +560,12 @@ impl Simulation {
         self.cells.iter().filter(|c| c.mat == mat).count()
     }
 
+    /// How many live creatures are of `kind`. Test-only.
+    #[cfg(test)]
+    pub(crate) fn count_kind(&self, kind: EntityKindId) -> usize {
+        self.entities.iter().filter(|e| e.kind == kind).count()
+    }
+
     /// Advance every creature one tick. Each creature's small state is *copied*
     /// out by index, advanced against `&mut Simulation`, then written back; the
     /// live list itself stays in place throughout, so a creature can sense the
@@ -673,7 +679,103 @@ mod tests {
     const FIRE: MaterialId = 6;
     const CLOUD: MaterialId = 10;
 
-    use crate::entities::{ANT, BIRD};
+    const ALGAE: MaterialId = 15;
+
+    use crate::entities::{ANT, BIRD, FISH};
+
+    /// Carve a stone tank `x0..x1` wide and `y0..y1` deep and fill it with water,
+    /// leaving the top open to the air. The walls and floor are a solid stone
+    /// margin around the pool, so the water stays put. Test helper.
+    fn fill_pool(sim: &mut Simulation, x0: usize, x1: usize, y0: usize, y1: usize) {
+        for x in (x0 - 1)..=x1 {
+            for y in y0..=(y1 + 1) {
+                sim.set(x, y, STONE);
+            }
+        }
+        for x in x0..x1 {
+            for y in y0..y1 {
+                sim.set(x, y, WATER);
+            }
+        }
+    }
+
+    #[test]
+    fn a_fish_grazes_algae_and_survives() {
+        // A fish in a weedy pool grazes the algae — the only proof we need is that
+        // it's still alive long past the point it would have starved with no food.
+        let mut sim = Simulation::new();
+        fill_pool(&mut sim, 90, 118, 210, 238);
+        for x in 92..116 {
+            sim.set(x, 236, ALGAE);
+        }
+        sim.spawn_entity(FISH, 104, 230);
+
+        for _ in 0..2100 {
+            sim.step();
+        }
+
+        assert!(
+            sim.count_kind(FISH) >= 1,
+            "a fish with algae to graze should not have starved"
+        );
+    }
+
+    #[test]
+    fn a_fish_leaps_from_the_water_to_eat_an_ant_on_the_bank() {
+        // An ant pacing the bank of a pool is fair game: a hungry fish lines up
+        // beneath it and leaps clear of the water to snatch it.
+        let mut sim = Simulation::new();
+        // A pool with a stone bank to its left for the ant to walk on; the bank's
+        // top sits level with the water's surface, the ant a step above the edge.
+        fill_pool(&mut sim, 100, 140, 200, 240);
+        for x in 90..100 {
+            for y in 200..242 {
+                sim.set(x, y, STONE);
+            }
+        }
+        sim.spawn_entity(ANT, 95, 199);
+        sim.spawn_entity(FISH, 120, 220);
+        assert_eq!(sim.count_kind(ANT), 1);
+
+        for _ in 0..1800 {
+            sim.step();
+        }
+
+        assert_eq!(
+            sim.count_kind(ANT),
+            0,
+            "the fish should have leapt out and eaten the ant"
+        );
+        assert!(sim.count_kind(FISH) >= 1, "the fish itself should survive");
+    }
+
+    #[test]
+    fn a_bird_prefers_a_fish_to_an_ant() {
+        // With both on the menu a bird goes for the fish first: dropped over a pool
+        // with a fish in it and ants on the shore, it takes the fish.
+        let mut sim = Simulation::new();
+        let floor = GRID_H - 1;
+        for x in 0..GRID_W {
+            sim.set(x, floor, STONE);
+        }
+        fill_pool(&mut sim, 100, 160, 120, 160);
+        for x in (40..90).step_by(6) {
+            sim.spawn_entity(ANT, x as i32, floor as i32 - 1);
+        }
+        sim.spawn_entity(FISH, 130, 130);
+        sim.spawn_entity(BIRD, 130, 30);
+        assert_eq!(sim.count_kind(FISH), 1);
+
+        for _ in 0..1500 {
+            sim.step();
+        }
+
+        assert_eq!(
+            sim.count_kind(FISH),
+            0,
+            "the bird should have taken the fish"
+        );
+    }
 
     #[test]
     fn an_ant_falls_to_the_ground_and_stays_put() {
