@@ -191,11 +191,16 @@ impl ApplicationHandler<UserEvent> for App {
                 button: MouseButton::Left,
                 ..
             } => {
-                if btn == ElementState::Pressed {
-                    // Start painting only if egui didn't take the click.
-                    self.input.drawing = !consumed;
-                    self.input.last_wind = None; // a fresh stroke has no direction yet
-                } else {
+                if btn == ElementState::Pressed && !consumed {
+                    // The meteor tool fires once per click rather than painting a
+                    // held stroke, so handle it here and leave `drawing` off.
+                    if self.input.controls.tool == ui::Tool::Meteor {
+                        self.summon_meteor();
+                    } else {
+                        self.input.drawing = true;
+                        self.input.last_wind = None; // a fresh stroke has no direction yet
+                    }
+                } else if btn != ElementState::Pressed {
                     self.input.drawing = false;
                 }
             }
@@ -209,8 +214,13 @@ impl ApplicationHandler<UserEvent> for App {
                 self.input.cursor = (touch.location.x, touch.location.y);
                 match touch.phase {
                     TouchPhase::Started => {
-                        self.input.drawing = !consumed;
-                        self.input.last_wind = None; // fresh stroke, no direction yet
+                        if !consumed && self.input.controls.tool == ui::Tool::Meteor {
+                            // One meteor per tap, like a mouse click.
+                            self.summon_meteor();
+                        } else {
+                            self.input.drawing = !consumed;
+                            self.input.last_wind = None; // fresh stroke, no direction yet
+                        }
                     }
                     TouchPhase::Moved => {} // keep painting; cursor already updated
                     TouchPhase::Ended | TouchPhase::Cancelled => self.input.drawing = false,
@@ -271,6 +281,9 @@ impl App {
                     }
                     self.input.last_wind = Some((gx, gy));
                 }
+                // Meteors fire on click (see `summon_meteor`), not on a held
+                // drag, so a held stroke does nothing here.
+                ui::Tool::Meteor => {}
             }
         }
 
@@ -300,6 +313,14 @@ impl App {
                 full_output.textures_delta,
                 full_output.pixels_per_point,
             );
+        }
+    }
+
+    /// Call a meteor down on the cell under the cursor (the Meteor tool's click).
+    fn summon_meteor(&mut self) {
+        if let Some(state) = &mut self.state {
+            let (gx, gy) = state.cursor_to_grid(self.input.cursor);
+            state.sim.spawn_meteor(gx, gy);
         }
     }
 
@@ -353,6 +374,8 @@ impl App {
             KeyCode::Digit0 | KeyCode::Backspace => c.material = EMPTY, // Eraser
             // Wind tool: sweep the cursor to blow a gust.
             KeyCode::KeyW => c.tool = ui::Tool::Wind,
+            // Meteor tool: click to call a meteor down on that spot.
+            KeyCode::KeyM => c.tool = ui::Tool::Meteor,
             // Brush size.
             KeyCode::BracketLeft => c.brush = (c.brush - 1).max(0),
             KeyCode::BracketRight => c.brush = (c.brush + 1).min(40),
@@ -408,7 +431,7 @@ pub fn run() {
     }
 
     log::info!(
-        "Controls: use the panel, or press 1=Sand 2=Stone 3=Water 4=Lava 5=Oil 6=Fire 7=Soil 8=Wood 9=Leaves  0/Backspace=Erase  W=wind tool (sweep to blow a gust)  [ ]=brush size  C=clear  G=generate world  R=random seed  (hold left mouse to draw)  — drag a .rhai file onto the window to add a material"
+        "Controls: use the panel, or press 1=Sand 2=Stone 3=Water 4=Lava 5=Oil 6=Fire 7=Soil 8=Wood 9=Leaves  0/Backspace=Erase  W=wind tool (sweep to blow a gust)  M=meteor tool (click to summon)  [ ]=brush size  C=clear  G=generate world  R=random seed  (hold left mouse to draw)  — drag a .rhai file onto the window to add a material"
     );
 
     let event_loop = EventLoop::<UserEvent>::with_user_event()

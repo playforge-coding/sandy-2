@@ -176,6 +176,82 @@ fn steps_from_velocity(sim: &mut Simulation, v: i32) -> i32 {
     mag / VEL_UNIT + sim.rand_ratio(frac, VEL_UNIT as u32) as i32
 }
 
+/// Fly a heavy projectile (a meteor) one tick along its own velocity, under
+/// gravity and *ignoring* the wind. Where [`drift`] eases toward the breeze and
+/// bleeds its momentum, a projectile keeps every bit of its speed and passes
+/// only through open air: the instant its path meets anything solid — or the
+/// floor, or a side wall — it stops and reports the cell it struck *from*, so the
+/// caller can detonate it. `gravity` is added to the downward velocity each tick,
+/// bending an aimed shot into a falling arc.
+///
+/// The whole-cell velocity (plus the usual fractional chance of one more) is
+/// walked out a cell at a time, interleaving the two axes with a small DDA so the
+/// flight traces a straight diagonal rather than an L-shaped kink. Returns
+/// `Ok(new_pos)` while still in flight, or `Err(impact_pos)` at the cell it hit
+/// from — where the projectile still sits, ready to be replaced by the blast.
+pub fn ballistic(
+    sim: &mut Simulation,
+    x: usize,
+    y: usize,
+    gravity: i32,
+) -> Result<(usize, usize), (usize, usize)> {
+    let (vx, vy0) = sim.velocity(x, y);
+    // Accelerate downward, saturating into the `i8` the cell stores velocity in.
+    let vy = (vy0 + gravity).min(i8::MAX as i32);
+    sim.set_velocity(x, y, vx, vy);
+
+    let hsteps = steps_from_velocity(sim, vx);
+    let vsteps = steps_from_velocity(sim, vy);
+    let hdir = vx.signum();
+    let vdir = vy.signum();
+    let n = hsteps.max(vsteps);
+
+    let mut cx = x as i32;
+    let mut cy = y as i32;
+    // DDA: spread the smaller axis's steps evenly across the larger one.
+    let (mut ax, mut ay) = (0, 0);
+    for _ in 0..n {
+        ax += hsteps;
+        ay += vsteps;
+        let mut nx = cx;
+        let mut ny = cy;
+        if ax >= n {
+            ax -= n;
+            nx += hdir;
+        }
+        if ay >= n {
+            ay -= n;
+            ny += vdir;
+        }
+        // Off a side wall or through the floor: detonate where we stand.
+        if nx < 0 || nx >= sim.width as i32 || ny >= sim.height as i32 {
+            return Err((cx as usize, cy as usize));
+        }
+        // Out the top (an upward shot that never came down): stop, still alive.
+        if ny < 0 {
+            return Ok((cx as usize, cy as usize));
+        }
+        // Advance one cell per axis, exploding the moment a step would enter
+        // anything that isn't open air (so it bursts on the ground rather than
+        // ploughing through it the way its great density otherwise would).
+        if nx != cx {
+            if sim.mat_at(nx as usize, cy as usize) != EMPTY {
+                return Err((cx as usize, cy as usize));
+            }
+            sim.try_move(cx as usize, cy as usize, nx as usize, cy as usize);
+            cx = nx;
+        }
+        if ny != cy {
+            if sim.mat_at(cx as usize, ny as usize) != EMPTY {
+                return Err((cx as usize, cy as usize));
+            }
+            sim.try_move(cx as usize, cy as usize, cx as usize, ny as usize);
+            cy = ny;
+        }
+    }
+    Ok((cx as usize, cy as usize))
+}
+
 /// Immovable: never moves. Used by stone, walls, bedrock.
 pub fn solid(_sim: &mut Simulation, _x: usize, _y: usize) {}
 

@@ -334,6 +334,42 @@ impl Simulation {
         }
     }
 
+    /// Summon a meteor aimed at `(target_x, target_y)`: it appears at the top of
+    /// the world, offset to one side, and streaks in on its own velocity —
+    /// arcing down under gravity — to explode into fire and lava where it lands
+    /// (see [`crate::materials::meteor`]). Coordinates are grid cells; an
+    /// off-grid target is ignored.
+    pub fn spawn_meteor(&mut self, target_x: i32, target_y: i32) {
+        if target_x < 0
+            || target_y < 0
+            || target_x as usize >= self.width
+            || target_y as usize >= self.height
+        {
+            return;
+        }
+        // Launch from the top edge, offset sideways by the drop height so it
+        // comes in on a slant. Offset toward whichever side has room, so the
+        // launch point stays on-screen and the streak crosses the view.
+        let drop = target_y.max(1);
+        let sx = if (target_x as usize) >= self.width / 2 {
+            (target_x - drop).max(0)
+        } else {
+            (target_x + drop).min(self.width as i32 - 1)
+        };
+        // Velocity from the launch point at the target, scaled to a brisk few
+        // cells per tick. Gravity then bends the path into a falling arc, so the
+        // meteor lands at roughly — not exactly — the clicked spot.
+        let dx = (target_x - sx) as f32;
+        let dy = target_y.max(1) as f32; // launch row is 0
+        let len = (dx * dx + dy * dy).sqrt().max(1.0);
+        let speed = 3.0 * VEL_UNIT as f32;
+        let vx = (dx / len * speed) as i32;
+        let vy = (dy / len * speed) as i32;
+        let sx = sx as usize;
+        self.set(sx, 0, materials::METEOR);
+        self.set_velocity(sx, 0, vx, vy);
+    }
+
     pub fn clear(&mut self) {
         for c in self.cells.iter_mut() {
             *c = VOID;

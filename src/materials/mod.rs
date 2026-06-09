@@ -30,6 +30,7 @@ mod empty;
 mod fire;
 mod lava;
 mod leaves;
+mod meteor;
 mod oil;
 mod rain;
 mod sand;
@@ -67,6 +68,8 @@ pub const CLOUD: MaterialId = 10;
 pub const RAIN: MaterialId = 11;
 pub const WET_SOIL: MaterialId = 12;
 pub const SEEDS: MaterialId = 13;
+/// Summoned by the Meteor tool; explodes into fire and lava on impact.
+pub const METEOR: MaterialId = 14;
 
 /// A material's static, render- and physics-relevant properties.
 #[derive(Clone, Copy)]
@@ -159,9 +162,10 @@ fn builtins() -> Vec<&'static dyn Material> {
     static RAIN: rain::Rain = rain::Rain; // id 11
     static WET_SOIL: wet_soil::WetSoil = wet_soil::WetSoil; // id 12
     static SEEDS: seeds::Seeds = seeds::Seeds; // id 13
+    static METEOR: meteor::Meteor = meteor::Meteor; // id 14
     vec![
         &EMPTY, &SAND, &STONE, &WATER, &LAVA, &OIL, &FIRE, &SOIL, &WOOD, &LEAVES, &CLOUD, &RAIN,
-        &WET_SOIL, &SEEDS,
+        &WET_SOIL, &SEEDS, &METEOR,
     ]
 }
 

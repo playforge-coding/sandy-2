@@ -24,6 +24,9 @@ pub enum Tool {
     Paint,
     /// Blow wind the way the cursor is swept.
     Wind,
+    /// Summon a meteor at the clicked spot (see
+    /// [`crate::sim::Simulation::spawn_meteor`]).
+    Meteor,
 }
 
 /// Control state shared between the egui panel and the keyboard shortcuts in
@@ -135,6 +138,15 @@ pub fn draw(ctx: &egui::Context, c: &mut Controls) -> Actions {
                 c.tool = Tool::Wind;
             }
 
+            // The meteor tool: click anywhere to call down a meteor on that spot.
+            let mut meteor_btn = egui::Button::new("☄ Meteor").min_size(button_size);
+            if c.tool == Tool::Meteor {
+                meteor_btn = meteor_btn.stroke(Stroke::new(2.0, Color32::WHITE));
+            }
+            if ui.add(meteor_btn).clicked() {
+                c.tool = Tool::Meteor;
+            }
+
             ui.separator();
             let brush_label = if c.tool == Tool::Wind {
                 "Gust size"
@@ -167,6 +179,7 @@ pub fn draw(ctx: &egui::Context, c: &mut Controls) -> Actions {
             ui.label(
                 RichText::new(
                     "Hold left-mouse to draw · pick Wind and sweep to blow a gust · \
+                     pick Meteor and click to call one down · \
                      drag a .rhai file to add a material",
                 )
                 .small()
