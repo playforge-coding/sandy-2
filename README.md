@@ -98,7 +98,7 @@ cargo run --release
 
 ## Run on the web
 
-The web build uses [Trunk](https://trunkrs.dev):
+The web build uses [Trunk](https://trunk-rs.github.io/trunk/):
 
 ```sh
 rustup target add wasm32-unknown-unknown
