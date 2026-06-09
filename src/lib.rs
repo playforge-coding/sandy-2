@@ -1,6 +1,7 @@
 //! Sandy — a basic, extensible falling-sand simulation.
 //!
 //! - `materials` — one file per material + the registry (where you add new ones).
+//! - `entities`   — creatures (ants, birds) that move over the grid, not in it.
 //! - `behaviors`  — shared movement logic materials reuse (falling, piling, …).
 //! - `sim`        — the grid and the tick loop.
 //! - `gpu`        — wgpu setup and per-frame rendering.
@@ -11,6 +12,7 @@
 
 mod app;
 mod behaviors;
+mod entities;
 mod gpu;
 mod materials;
 mod plugin;

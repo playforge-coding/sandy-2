@@ -203,13 +203,16 @@ impl ApplicationHandler<UserEvent> for App {
                 ..
             } => {
                 if btn == ElementState::Pressed && !consumed {
-                    // The meteor tool fires once per click rather than painting a
-                    // held stroke, so handle it here and leave `drawing` off.
-                    if self.input.controls.tool == ui::Tool::Meteor {
-                        self.summon_meteor();
-                    } else {
-                        self.input.drawing = true;
-                        self.input.last_wind = None; // a fresh stroke has no direction yet
+                    // The meteor and creature tools act once per click rather than
+                    // painting a held stroke, so handle them here and leave
+                    // `drawing` off.
+                    match self.input.controls.tool {
+                        ui::Tool::Meteor => self.summon_meteor(),
+                        ui::Tool::Creature => self.place_creature(),
+                        _ => {
+                            self.input.drawing = true;
+                            self.input.last_wind = None; // a fresh stroke has no direction yet
+                        }
                     }
                 } else if btn != ElementState::Pressed {
                     self.input.drawing = false;
@@ -224,15 +227,15 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Touch(touch) => {
                 self.input.cursor = (touch.location.x, touch.location.y);
                 match touch.phase {
-                    TouchPhase::Started => {
-                        if !consumed && self.input.controls.tool == ui::Tool::Meteor {
-                            // One meteor per tap, like a mouse click.
-                            self.summon_meteor();
-                        } else {
+                    TouchPhase::Started => match (consumed, self.input.controls.tool) {
+                        // One meteor / creature per tap, like a mouse click.
+                        (false, ui::Tool::Meteor) => self.summon_meteor(),
+                        (false, ui::Tool::Creature) => self.place_creature(),
+                        _ => {
                             self.input.drawing = !consumed;
                             self.input.last_wind = None; // fresh stroke, no direction yet
                         }
-                    }
+                    },
                     TouchPhase::Moved => {} // keep painting; cursor already updated
                     TouchPhase::Ended | TouchPhase::Cancelled => self.input.drawing = false,
                 }
@@ -292,9 +295,10 @@ impl App {
                     }
                     self.input.last_wind = Some((gx, gy));
                 }
-                // Meteors fire on click (see `summon_meteor`), not on a held
-                // drag, so a held stroke does nothing here.
-                ui::Tool::Meteor => {}
+                // Meteors and creatures act on click (see `summon_meteor` /
+                // `place_creature`), not on a held drag, so a held stroke does
+                // nothing here.
+                ui::Tool::Meteor | ui::Tool::Creature => {}
             }
         }
 
@@ -332,6 +336,15 @@ impl App {
         if let Some(state) = &mut self.state {
             let (gx, gy) = state.cursor_to_grid(self.input.cursor);
             state.sim.spawn_meteor(gx, gy);
+        }
+    }
+
+    /// Drop the selected creature at the cell under the cursor (the Creature
+    /// tool's click).
+    fn place_creature(&mut self) {
+        if let Some(state) = &mut self.state {
+            let (gx, gy) = state.cursor_to_grid(self.input.cursor);
+            state.sim.spawn_entity(self.input.controls.entity, gx, gy);
         }
     }
 
@@ -387,6 +400,15 @@ impl App {
             KeyCode::KeyW => c.tool = ui::Tool::Wind,
             // Meteor tool: click to call a meteor down on that spot.
             KeyCode::KeyM => c.tool = ui::Tool::Meteor,
+            // Creature tools: click to drop the chosen creature on that spot.
+            KeyCode::KeyA => {
+                c.entity = crate::entities::ANT;
+                c.tool = ui::Tool::Creature;
+            }
+            KeyCode::KeyB => {
+                c.entity = crate::entities::BIRD;
+                c.tool = ui::Tool::Creature;
+            }
             // Brush size.
             KeyCode::BracketLeft => c.brush = (c.brush - 1).max(0),
             KeyCode::BracketRight => c.brush = (c.brush + 1).min(40),
@@ -442,7 +464,7 @@ pub fn run() {
     }
 
     log::info!(
-        "Controls: use the panel, or press 1=Sand 2=Stone 3=Water 4=Lava 5=Oil 6=Fire 7=Soil 8=Wood 9=Leaves  0/Backspace=Erase  W=wind tool (sweep to blow a gust)  M=meteor tool (click to summon)  [ ]=brush size  C=clear  G=generate world  R=random seed  (hold left mouse to draw)  — drag a .rhai file onto the window to add a material"
+        "Controls: use the panel, or press 1=Sand 2=Stone 3=Water 4=Lava 5=Oil 6=Fire 7=Soil 8=Wood 9=Leaves  0/Backspace=Erase  W=wind tool (sweep to blow a gust)  M=meteor tool (click to summon)  A=ant B=bird (click to drop one)  [ ]=brush size  C=clear  G=generate world  R=random seed  (hold left mouse to draw)  — drag a .rhai file onto the window to add a material"
     );
 
     let event_loop = EventLoop::<UserEvent>::with_user_event()

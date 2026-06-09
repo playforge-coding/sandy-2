@@ -10,6 +10,7 @@
 
 use egui::{Color32, RichText, Stroke};
 
+use crate::entities::{self, EntityKindId};
 use crate::materials::{self, MaterialId};
 
 /// Longest seed the user can type — keeps the value comfortably within `u32`.
@@ -27,6 +28,9 @@ pub enum Tool {
     /// Summon a meteor at the clicked spot (see
     /// [`crate::sim::Simulation::spawn_meteor`]).
     Meteor,
+    /// Place a creature of [`Controls::entity`] at the clicked spot (see
+    /// [`crate::sim::Simulation::spawn_entity`]).
+    Creature,
 }
 
 /// Control state shared between the egui panel and the keyboard shortcuts in
@@ -39,6 +43,10 @@ pub struct Controls {
     ///
     /// [`tool`]: Controls::tool
     pub material: MaterialId,
+    /// Creature the placement tool drops (when [`tool`] is [`Tool::Creature`]).
+    ///
+    /// [`tool`]: Controls::tool
+    pub entity: EntityKindId,
     /// Brush radius, in grid cells. Doubles as the wind tool's gust radius.
     pub brush: i32,
     /// The world seed, as text so it can be edited in a box. Parsed to a `u32`
@@ -51,6 +59,7 @@ impl Default for Controls {
         Self {
             tool: Tool::Paint,
             material: 1, // Sand
+            entity: crate::entities::ANT,
             brush: 4,
             seed: crate::worldgen::DEFAULT_SEED.to_string(),
         }
@@ -148,6 +157,24 @@ pub fn draw(ctx: &egui::Context, c: &mut Controls) -> Actions {
             }
 
             ui.separator();
+            // Creatures: pick one, then click in the world to drop it there.
+            ui.label("Creatures");
+            for id in 0..entities::count() as EntityKindId {
+                let info = entities::get(id).info();
+                let fill = to_color32(info.color);
+                let mut btn = egui::Button::new(RichText::new(info.name).color(contrast(fill)))
+                    .fill(fill)
+                    .min_size(button_size);
+                if id == c.entity && c.tool == Tool::Creature {
+                    btn = btn.stroke(Stroke::new(2.0, Color32::WHITE));
+                }
+                if ui.add(btn).clicked() {
+                    c.entity = id;
+                    c.tool = Tool::Creature;
+                }
+            }
+
+            ui.separator();
             let brush_label = if c.tool == Tool::Wind {
                 "Gust size"
             } else {
@@ -180,6 +207,7 @@ pub fn draw(ctx: &egui::Context, c: &mut Controls) -> Actions {
                 RichText::new(
                     "Hold left-mouse to draw · pick Wind and sweep to blow a gust · \
                      pick Meteor and click to call one down · \
+                     pick a creature and click to drop one · \
                      drag a .rhai file to add a material",
                 )
                 .small()

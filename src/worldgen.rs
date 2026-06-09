@@ -18,6 +18,7 @@
 
 use fastnoise_lite::{FastNoiseLite, FractalType, NoiseType};
 
+use crate::entities::{ANT, BIRD};
 use crate::materials::{EMPTY, LEAVES, SOIL, STONE, WATER, WOOD};
 use crate::sim::Simulation;
 
@@ -29,6 +30,12 @@ const SOIL_DEPTH: usize = 7;
 
 /// Roughly one in this many land columns sprouts a tree.
 const TREE_RARITY: u32 = 11;
+
+/// Roughly one in this many dry-land columns starts with an ant on it.
+const ANT_RARITY: u32 = 40;
+
+/// How many birds wheel over a freshly-generated world.
+const BIRD_COUNT: u64 = 5;
 
 /// Build and paint a complete world for `seed`, replacing whatever was there.
 pub fn generate(sim: &mut Simulation, seed: i32) {
@@ -66,6 +73,25 @@ pub fn generate(sim: &mut Simulation, seed: i32) {
             continue;
         }
         plant_tree(sim, seed, x, top);
+    }
+
+    // ---- Creatures ----
+    // A scattering of ants ambling on the dry ground and a few birds aloft, so a
+    // freshly-generated world already has some life in it. (Placement is seeded
+    // by the same reproducible hash; the tick loop takes their motion from there.)
+    for x in 4..w.saturating_sub(4) {
+        let top = surface[x];
+        if top >= sea_level || hash(seed, x as i64, 3) % ANT_RARITY != 0 {
+            continue;
+        }
+        // Just above the surface cell, so the ant starts standing on the ground.
+        sim.spawn_entity(ANT, x as i32, top as i32 - 1);
+    }
+    for b in 0..BIRD_COUNT {
+        // Spread the birds evenly across the width, scattered a little in height.
+        let bx = (w as u64 * (2 * b + 1) / (2 * BIRD_COUNT)) as i32;
+        let by = (h as f32 * 0.18) as i32 + (hash(seed, b as i64, 4) % 20) as i32;
+        sim.spawn_entity(BIRD, bx, by);
     }
 }
 

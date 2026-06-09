@@ -10,12 +10,17 @@
 //! move them, but not what sand or stone "is". Per-material logic lives in
 //! `crate::materials::*`; shared motion lives in `crate::behaviors`.
 
+use crate::entities::{self, EntityKindId, EntityState};
 use crate::materials::{self, MaterialId, MaterialInfo, EMPTY};
 
 /// Simulation resolution. The renderer stretches this to fill the window, so
 /// these are "logical sand pixels", independent of the actual window size.
 pub const GRID_W: usize = 500;
 pub const GRID_H: usize = 250;
+
+/// Hard cap on the number of live creatures, a backstop against a behaviour that
+/// spawns without bound. Far above any sane population.
+const MAX_ENTITIES: usize = 4096;
 
 /// One cell of the world.
 #[derive(Clone, Copy)]
@@ -105,6 +110,11 @@ pub struct Simulation {
     /// so we snapshot every material's `info()` once per tick (cheap — a handful
     /// of entries) and index this array instead.
     infos: Vec<MaterialInfo>,
+    /// The live creatures (ants, birds, …). Unlike materials these aren't stored
+    /// in the grid: they carry their own position and state and move *over* the
+    /// cells. Stepped after the grid each tick (see [`Simulation::step_entities`])
+    /// and drawn as an overlay (see [`Simulation::render_into`]).
+    entities: Vec<EntityState>,
 }
 
 impl Simulation {
@@ -120,6 +130,7 @@ impl Simulation {
             wind_y: vec![0; GRID_W * GRID_H],
             gust_active: false,
             infos: Self::snapshot_infos(),
+            entities: Vec::new(),
         }
     }
 
@@ -210,6 +221,15 @@ impl Simulation {
     #[inline]
     pub(crate) fn rand_bool(&mut self) -> bool {
         self.rand() & 1 == 0
+    }
+
+    /// A pseudo-random `f32` in `[0, 1)`. The floating-point convenience over
+    /// [`rand`](Self::rand) for the smooth steering entities do.
+    #[inline]
+    pub(crate) fn rand_f32(&mut self) -> f32 {
+        // Top 24 bits → an exact float in [0, 1); the low 8 are the weakest of
+        // the xorshift anyway.
+        (self.rand() >> 8) as f32 / (1u32 << 24) as f32
     }
 
     /// A fresh pseudo-random `u32`. Used to mint a random world seed when the
@@ -378,6 +398,8 @@ impl Simulation {
         self.wind_x.iter_mut().for_each(|v| *v = 0);
         self.wind_y.iter_mut().for_each(|v| *v = 0);
         self.gust_active = false;
+        // And clear out the wildlife: a cleared world is empty of creatures too.
+        self.entities.clear();
     }
 
     /// Advance the wind one tick: refresh the ambient breeze and fade any gusts.
@@ -437,6 +459,10 @@ impl Simulation {
                 materials::get(id).update(self, x, y);
             }
         }
+
+        // Creatures move after the grid has settled for the tick, so they walk
+        // and fly over the cells in their just-updated positions.
+        self.step_entities();
     }
 
     /// Render the grid into a tightly-packed RGBA8 buffer
@@ -458,6 +484,27 @@ impl Simulation {
             rgba[3] = if info.glow { 0 } else { 255 };
             buf[i * 4..i * 4 + 4].copy_from_slice(&rgba);
         }
+
+        // Creatures ride on top of the grid: stamp each one's sprite over the
+        // cells it covers, after the grid so it's never painted over. There are
+        // few of them (and few kinds), so going through the registry per creature
+        // here is cheap — unlike the per-cell material lookup above, which is why
+        // that one reads the cached `infos` instead.
+        for e in &self.entities {
+            let info = entities::get(e.kind).info();
+            let (ex, ey) = (e.x.round() as i32, e.y.round() as i32);
+            let mut rgba = info.color;
+            rgba[3] = if info.glow { 0 } else { 255 };
+            for &(dx, dy) in info.sprite {
+                let px = ex + dx as i32;
+                let py = ey + dy as i32;
+                if px < 0 || py < 0 || px as usize >= self.width || py as usize >= self.height {
+                    continue;
+                }
+                let i = self.idx(px as usize, py as usize);
+                buf[i * 4..i * 4 + 4].copy_from_slice(&rgba);
+            }
+        }
     }
 
     /// The material id at `(x, y)`. Used by tests and by the plugin host API so
@@ -465,6 +512,73 @@ impl Simulation {
     #[inline]
     pub(crate) fn mat_at(&self, x: usize, y: usize) -> MaterialId {
         self.cells[self.idx(x, y)].mat
+    }
+
+    /// The material id at `(x, y)`, or `None` if the coordinates fall outside the
+    /// world — the bounds-checked cousin of [`mat_at`](Self::mat_at), for callers
+    /// (creatures sensing the cells around themselves) that may peek past an edge.
+    #[inline]
+    pub(crate) fn cell_mat(&self, x: i32, y: i32) -> Option<MaterialId> {
+        if x < 0 || y < 0 || x as usize >= self.width || y as usize >= self.height {
+            None
+        } else {
+            Some(self.cells[self.idx(x as usize, y as usize)].mat)
+        }
+    }
+
+    /// Drop a creature of `kind` into the world at grid cell `(gx, gy)`. A no-op
+    /// for an off-grid spot, an unknown kind, or once the entity cap is hit. The
+    /// facing is randomised so creatures placed together don't all set off in
+    /// lockstep.
+    pub fn spawn_entity(&mut self, kind: EntityKindId, gx: i32, gy: i32) {
+        if gx < 0 || gy < 0 || gx as usize >= self.width || gy as usize >= self.height {
+            return;
+        }
+        if kind as usize >= entities::count() || self.entities.len() >= MAX_ENTITIES {
+            return;
+        }
+        let dir = if self.rand_bool() { 1 } else { -1 };
+        self.entities
+            .push(EntityState::new(kind, gx as f32, gy as f32, dir));
+    }
+
+    /// How many creatures are currently alive in the world.
+    pub fn entity_count(&self) -> usize {
+        self.entities.len()
+    }
+
+    /// The position of the `i`th live creature, in grid cells. Test-only.
+    #[cfg(test)]
+    pub(crate) fn entity_pos(&self, i: usize) -> (f32, f32) {
+        let e = &self.entities[i];
+        (e.x, e.y)
+    }
+
+    /// Advance every creature one tick. The live set is moved out for the
+    /// duration so a creature's `update` can borrow `&mut Simulation` freely (and
+    /// even spawn more — a fresh creature lands in `self.entities` while the
+    /// in-flight set is held aside, then is folded back in below). Each creature's
+    /// small state is copied out, advanced, and written back; dead ones are reaped.
+    fn step_entities(&mut self) {
+        if self.entities.is_empty() {
+            return;
+        }
+        let mut ents = std::mem::take(&mut self.entities);
+        for i in 0..ents.len() {
+            if !ents[i].alive {
+                continue;
+            }
+            let mut e = ents[i];
+            entities::get(e.kind).update(self, &mut e);
+            ents[i] = e;
+        }
+        ents.retain(|e| e.alive);
+        // `self.entities` now holds anything spawned during this tick; merge it.
+        ents.append(&mut self.entities);
+        if ents.len() > MAX_ENTITIES {
+            ents.truncate(MAX_ENTITIES);
+        }
+        self.entities = ents;
     }
 }
 
@@ -479,6 +593,90 @@ mod tests {
     const OIL: MaterialId = 5;
     const FIRE: MaterialId = 6;
     const CLOUD: MaterialId = 10;
+
+    use crate::entities::{ANT, BIRD};
+
+    #[test]
+    fn an_ant_falls_to_the_ground_and_stays_put() {
+        // An ant dropped in mid-air falls until it has solid footing, then paces
+        // along it — never sinking through, never tumbling off the floor.
+        let mut sim = Simulation::new();
+        let floor = GRID_H - 1;
+        for x in 0..GRID_W {
+            sim.set(x, floor, STONE);
+        }
+        sim.spawn_entity(ANT, 100, 10);
+        assert_eq!(sim.entity_count(), 1);
+        for _ in 0..200 {
+            sim.step();
+        }
+        assert_eq!(sim.entity_count(), 1, "ant on solid ground should survive");
+        let (x, y) = sim.entity_pos(0);
+        assert!(y < floor as f32, "ant should rest on the stone, not in it");
+        assert!(
+            y >= (floor - 2) as f32,
+            "ant should have come to rest on top of the floor"
+        );
+        assert!(
+            x >= 0.0 && x < GRID_W as f32,
+            "ant should stay within the world"
+        );
+    }
+
+    #[test]
+    fn an_ant_drowns_in_water() {
+        // An ant standing in liquid is reaped.
+        let mut sim = Simulation::new();
+        let floor = GRID_H - 1;
+        for x in 0..GRID_W {
+            sim.set(x, floor, WATER);
+        }
+        sim.spawn_entity(ANT, 100, floor as i32);
+        assert_eq!(sim.entity_count(), 1);
+        sim.step();
+        assert_eq!(sim.entity_count(), 0, "an ant in water should drown");
+    }
+
+    #[test]
+    fn a_bird_stays_aloft_over_the_terrain() {
+        // A bird in the open sky keeps flying — it neither sinks into the ground
+        // nor leaves the world.
+        let mut sim = Simulation::new();
+        let floor = GRID_H - 1;
+        for x in 0..GRID_W {
+            sim.set(x, floor, STONE);
+        }
+        sim.spawn_entity(BIRD, 50, 30);
+        for _ in 0..300 {
+            sim.step();
+        }
+        assert_eq!(sim.entity_count(), 1, "bird should keep flying");
+        let (x, y) = sim.entity_pos(0);
+        assert!(y < (floor - 1) as f32, "bird should stay above the terrain");
+        assert!(
+            x >= 0.0 && x < GRID_W as f32,
+            "bird should stay within the world"
+        );
+    }
+
+    #[test]
+    fn clearing_the_world_removes_creatures() {
+        let mut sim = Simulation::new();
+        sim.spawn_entity(ANT, 10, 10);
+        sim.spawn_entity(BIRD, 20, 20);
+        assert_eq!(sim.entity_count(), 2);
+        sim.clear();
+        assert_eq!(sim.entity_count(), 0);
+    }
+
+    #[test]
+    fn an_off_grid_creature_is_not_placed() {
+        let mut sim = Simulation::new();
+        sim.spawn_entity(ANT, -1, 10);
+        sim.spawn_entity(ANT, GRID_W as i32, 10);
+        sim.spawn_entity(ANT, 10, GRID_H as i32);
+        assert_eq!(sim.entity_count(), 0);
+    }
 
     #[test]
     fn sand_falls_to_the_floor() {
