@@ -10,12 +10,12 @@
 //! move them, but not what sand or stone "is". Per-material logic lives in
 //! `crate::materials::*`; shared motion lives in `crate::behaviors`.
 
-use crate::materials::{self, MaterialId, EMPTY};
+use crate::materials::{self, MaterialId, MaterialInfo, EMPTY};
 
 /// Simulation resolution. The renderer stretches this to fill the window, so
 /// these are "logical sand pixels", independent of the actual window size.
-pub const GRID_W: usize = 300;
-pub const GRID_H: usize = 200;
+pub const GRID_W: usize = 500;
+pub const GRID_H: usize = 250;
 
 /// One cell of the world.
 #[derive(Clone, Copy)]
@@ -28,7 +28,12 @@ struct Cell {
     /// that already moved this tick, so a particle is processed at most once —
     /// without this, a *rising* particle (gas/fire) would be re-encountered by
     /// the same scan in the row above and teleport to the ceiling in one tick.
-    moved: u64,
+    ///
+    /// Truncated to `u32` (compared against `frame as u32`) so `Cell` packs into
+    /// 8 bytes instead of 16 — halving the grid's memory footprint and the
+    /// bandwidth of every scan, swap, and render. The counter only ever needs to
+    /// match *this* tick's frame, so the ~2-year wrap at 60 fps is harmless.
+    moved: u32,
 }
 
 const VOID: Cell = Cell {
@@ -54,6 +59,13 @@ pub struct Simulation {
     /// variable getting negated on a timer (see [`Simulation::step`]). Clouds
     /// read it to decide which way to drift.
     wind: i32,
+    /// Per-id [`MaterialInfo`] cache, indexed by [`MaterialId`]. Looking a
+    /// material up in the registry costs a `thread_local` + `RefCell` borrow and
+    /// a dynamic call; doing that per cell in the hot `try_move`/`render_into`
+    /// paths dominated the tick. The registry only changes when a plugin loads,
+    /// so we snapshot every material's `info()` once per tick (cheap — a handful
+    /// of entries) and index this array instead.
+    infos: Vec<MaterialInfo>,
 }
 
 impl Simulation {
@@ -65,7 +77,17 @@ impl Simulation {
             frame: 0,
             rng: 0x9E37_79B9,
             wind: 1,
+            infos: Self::snapshot_infos(),
         }
+    }
+
+    /// Snapshot every registered material's [`MaterialInfo`] into a flat table
+    /// indexed by id. Refreshed once per tick so the per-cell hot paths can read
+    /// `self.infos[id]` instead of going through the registry. See `infos`.
+    fn snapshot_infos() -> Vec<MaterialInfo> {
+        (0..materials::count())
+            .map(|id| materials::get(id as MaterialId).info())
+            .collect()
     }
 
     /// The current prevailing wind direction (`-1` left, `+1` right). Materials
@@ -127,8 +149,8 @@ impl Simulation {
         } else {
             // A denser movable material sinks through a lighter movable one
             // (e.g. sand through water, once water exists). Solids block all.
-            let src_density = materials::get(self.cells[si].mat).info().density;
-            let tgt = materials::get(target).info();
+            let src_density = self.infos[self.cells[si].mat as usize].density;
+            let tgt = self.infos[target as usize];
             tgt.movable && src_density > tgt.density
         };
 
@@ -136,7 +158,7 @@ impl Simulation {
             self.cells.swap(si, ti);
             // The active particle now lives at `ti`; stamp it so this tick's
             // scan won't process it again (see `Cell::moved`).
-            self.cells[ti].moved = self.frame;
+            self.cells[ti].moved = self.frame as u32;
             true
         } else {
             false
@@ -217,6 +239,12 @@ impl Simulation {
         if self.frame % WIND_PERIOD == 0 {
             self.wind = -self.wind;
         }
+        // Refresh the per-id info cache for this tick's hot paths (`try_move`,
+        // and `render_into` which runs right after). Cheap: one entry per
+        // material, and it picks up any plugin registered since last tick.
+        self.infos.clear();
+        self.infos
+            .extend((0..materials::count()).map(|id| materials::get(id as MaterialId).info()));
         let (w, h) = (self.width, self.height);
 
         // Bottom row first so settled particles don't get re-processed.
@@ -231,7 +259,7 @@ impl Simulation {
                 }
                 // Already moved into this row this tick — skip so it isn't
                 // processed twice (keeps rising gas from racing to the top).
-                if cell.moved == self.frame {
+                if cell.moved == self.frame as u32 {
                     continue;
                 }
                 let id = cell.mat;
@@ -247,7 +275,11 @@ impl Simulation {
     pub fn render_into(&self, buf: &mut [u8]) {
         debug_assert_eq!(buf.len(), self.width * self.height * 4);
         for (i, cell) in self.cells.iter().enumerate() {
-            let info = materials::get(cell.mat).info();
+            // Index the per-tick info cache rather than the registry (one
+            // `thread_local`/`RefCell` borrow per cell, over the whole grid,
+            // every frame, was a measurable slice of the render). `step` runs
+            // immediately before each render and keeps this in sync.
+            let info = &self.infos[cell.mat as usize];
             let mut rgba = info.shade(cell.variant);
             // The alpha channel is repurposed as a "this pixel glows" flag for
             // the renderer's bloom pass: 0 = emissive, 255 = opaque. (We never
