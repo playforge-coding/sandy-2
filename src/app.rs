@@ -146,7 +146,18 @@ impl ApplicationHandler<UserEvent> for App {
         let UserEvent::StateReady(state) = event;
         self.state = Some(state);
         self.ensure_egui();
-        if let Some(state) = &self.state {
+        if let Some(state) = &mut self.state {
+            // On the web the canvas only gets its real size after layout, which
+            // lands while the GPU device is still initialising — so the initial
+            // `Resized` event fires before `state` exists and is dropped, leaving
+            // the surface at the 0x0→1x1 size it was first configured with. The
+            // WebGPU backend forces the canvas backing store to match that
+            // config, so without this the canvas stays 1x1 and the whole page is
+            // a single stretched pixel. Re-apply the window's current size now
+            // that the state is live. (WebGL happened to mask this by rendering
+            // at the canvas's own backing size.)
+            let size = state.window().inner_size();
+            state.resize(size.width, size.height);
             state.window().request_redraw();
         }
     }

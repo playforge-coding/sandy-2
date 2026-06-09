@@ -65,13 +65,46 @@ impl State {
         let width = size.width.max(1);
         let height = size.height.max(1);
 
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            flags: wgpu::InstanceFlags::default(),
-            memory_budget_thresholds: Default::default(),
-            backend_options: Default::default(),
-            display: None,
-        });
+        let make_instance = |backends| {
+            wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends,
+                flags: wgpu::InstanceFlags::default(),
+                memory_budget_thresholds: Default::default(),
+                backend_options: Default::default(),
+                display: None,
+            })
+        };
+
+        // Picking the backend on the web is subtle: wgpu commits to the WebGPU
+        // backend whenever `navigator.gpu` merely *exists*, but some browsers
+        // (e.g. Chromium on Linux without a usable GPU) expose that property yet
+        // still hand back no adapter. Creating the surface binds the canvas to a
+        // WebGPU context, after which WebGL can't claim it either — so the failed
+        // adapter request would just panic with no way to recover. Probe for a
+        // real WebGPU adapter *surfacelessly* first (the canvas stays unbound),
+        // and fall back to the WebGL backend if there isn't one.
+        #[cfg(target_arch = "wasm32")]
+        let backends = {
+            let probe = make_instance(wgpu::Backends::BROWSER_WEBGPU);
+            let webgpu_ok = probe
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                })
+                .await
+                .is_ok();
+            if webgpu_ok {
+                wgpu::Backends::BROWSER_WEBGPU
+            } else {
+                log::warn!("no WebGPU adapter available; falling back to WebGL");
+                wgpu::Backends::GL
+            }
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let backends = wgpu::Backends::all();
+
+        let instance = make_instance(backends);
 
         // Arc<Window> gives us a 'static surface that keeps the window alive.
         let surface = instance
@@ -88,9 +121,15 @@ impl State {
             .expect("no suitable GPU adapter found");
 
         // On the web (WebGL) we must stay within the conservative downlevel
-        // limits; native can use the full defaults.
+        // limits; native can use the full defaults. `downlevel_webgl2_defaults`
+        // caps textures at 2048px, but the surface has to match the canvas's
+        // backing store, which on a HiDPI display is larger than that (e.g.
+        // 2560x1856) — configuring it would then fail validation. Raise just the
+        // resolution limits to whatever the adapter actually supports (real
+        // WebGL2 contexts allow far more than 2048) so the full-size surface is
+        // valid.
         let required_limits = if cfg!(target_arch = "wasm32") {
-            wgpu::Limits::downlevel_webgl2_defaults()
+            wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits())
         } else {
             wgpu::Limits::default()
         };
@@ -452,8 +491,13 @@ impl State {
         if width == 0 || height == 0 {
             return;
         }
-        self.config.width = width;
-        self.config.height = height;
+        // Never let the surface exceed the device's max texture size, or
+        // `configure` panics with a validation error. This shouldn't bite now
+        // that the device is created with the adapter's real resolution limits,
+        // but a huge canvas on a low-limit device would otherwise be fatal.
+        let max = self.device.limits().max_texture_dimension_2d;
+        self.config.width = width.min(max);
+        self.config.height = height.min(max);
         self.surface.configure(&self.device, &self.config);
     }
 
