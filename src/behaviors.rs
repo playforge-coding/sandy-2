@@ -10,7 +10,14 @@
 //! material can call any of them.
 
 use crate::materials::{MaterialId, EMPTY, FIRE, LAVA};
-use crate::sim::Simulation;
+use crate::sim::{Simulation, VEL_UNIT};
+
+/// How quickly a wind-borne cell's velocity chases the wind: it closes `1/this`
+/// of the gap each tick. A low-pass filter — big enough that a gust takes hold
+/// within a few ticks, small enough that the cell keeps coasting for a moment
+/// after the gust drops (and, when the wind is calm, bleeds its momentum back to
+/// zero, so no separate friction term is needed).
+const WIND_RESPONSE: i32 = 3;
 
 /// Catch fire from an adjacent flame or lava, turning this cell into [`FIRE`].
 ///
@@ -91,6 +98,82 @@ pub fn emit(sim: &mut Simulation, x: usize, y: usize, product: MaterialId, rarit
     } else {
         false
     }
+}
+
+/// Carry a wind-borne cell along the wind for one tick, then report where it
+/// ended up. This is the shared "ride the wind" motion: fire, clouds, and rain
+/// call it before their own characteristic motion (rising, bobbing, falling), so
+/// a gust leans, drifts, and slants them. A material opts into wind simply by
+/// calling this — nothing else does, so dense things like sand stay put.
+///
+/// The cell's stored velocity eases toward the local wind ([`Simulation::wind_at`])
+/// rather than snapping to it, which gives the motion inertia: it ramps up as a
+/// gust arrives and coasts on after it passes. The whole-cell part of that
+/// velocity (plus a fractional chance of one more cell — see
+/// [`Simulation::rand_ratio`]) is then walked out one step at a time, first
+/// horizontally then vertically. Each hop goes through [`Simulation::try_move`],
+/// so the cell only enters space it may, and on hitting something it sheds the
+/// blocked component of its momentum (a soft collision).
+///
+/// `escape` decides what the world edge does. A cloud blown off the side should
+/// drift away for good (`true` → the cell is cleared and `None` returned); rain
+/// or a flame should just pile against the wall (`false`). Returns the cell's new
+/// position, or `None` if it left the world — in which case the caller must stop
+/// touching the cell, as it no longer exists.
+pub fn drift(sim: &mut Simulation, x: usize, y: usize, escape: bool) -> Option<(usize, usize)> {
+    let (wx, wy) = sim.wind_at(x, y);
+    let (vx0, vy0) = sim.velocity(x, y);
+    // Ease toward the wind (this also decays momentum to zero when it's calm).
+    let vx = vx0 + (wx - vx0) / WIND_RESPONSE;
+    let vy = vy0 + (wy - vy0) / WIND_RESPONSE;
+    sim.set_velocity(x, y, vx, vy);
+
+    let mut cx = x;
+    let mut cy = y;
+
+    // Horizontal transport.
+    let hdir = vx.signum();
+    for _ in 0..steps_from_velocity(sim, vx) {
+        let nx = cx as i32 + hdir;
+        if nx < 0 || nx as usize >= sim.width {
+            if escape {
+                sim.set(cx, cy, EMPTY);
+                return None;
+            }
+            sim.set_velocity(cx, cy, 0, vy); // hit the wall: lose sideways momentum
+            break;
+        }
+        if !sim.try_move(cx, cy, nx as usize, cy) {
+            sim.set_velocity(cx, cy, 0, vy); // blocked: shed horizontal momentum
+            break;
+        }
+        cx = nx as usize;
+    }
+
+    // Vertical transport, from wherever the horizontal step left the cell.
+    let vdir = vy.signum();
+    for _ in 0..steps_from_velocity(sim, vy) {
+        let ny = cy as i32 + vdir;
+        let blocked = ny < 0 || ny as usize >= sim.height || !sim.try_move(cx, cy, cx, ny as usize);
+        if blocked {
+            let (cvx, _) = sim.velocity(cx, cy);
+            sim.set_velocity(cx, cy, cvx, 0); // shed vertical momentum
+            break;
+        }
+        cy = ny as usize;
+    }
+
+    Some((cx, cy))
+}
+
+/// How many whole cells a velocity component carries the cell this tick: its
+/// integer cells-per-tick, plus a `1/VEL_UNIT`-weighted chance of one extra so
+/// sub-cell speeds aren't simply rounded away. Always non-negative — direction
+/// is the caller's `signum`.
+fn steps_from_velocity(sim: &mut Simulation, v: i32) -> i32 {
+    let mag = v.abs();
+    let frac = (mag % VEL_UNIT) as u32;
+    mag / VEL_UNIT + sim.rand_ratio(frac, VEL_UNIT as u32) as i32
 }
 
 /// Immovable: never moves. Used by stone, walls, bedrock.

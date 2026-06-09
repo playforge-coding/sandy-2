@@ -1,16 +1,18 @@
 //! Cloud — a drifting puff that rains.
 //!
-//! A cloud doesn't fall, but it isn't pinned either: it rides the prevailing
-//! wind (see [`Simulation::wind`]) sideways and slowly bobs upward, the way a
-//! real cloud loiters across the sky. Every so often a cell sheds a drop of
-//! [`RAIN`] into the open air directly beneath it; the rain then falls on its
-//! own and wets whatever soil it lands on — see `rain.rs`.
+//! A cloud doesn't fall, but it isn't pinned either: it rides the wind (see
+//! [`behaviors::drift`]) sideways and slowly bobs upward, the way a real cloud
+//! loiters across the sky. Every so often a cell sheds a drop of [`RAIN`] into
+//! the open air directly beneath it; the rain then falls on its own and wets
+//! whatever soil it lands on — see `rain.rs`. Blown to the edge of the world a
+//! cloud drifts off and is gone, a cell at a time.
 //!
 //! Movement goes through `try_move`, so a cloud only ever drifts into open air
 //! and the bottom-to-top scan's `moved` stamp keeps a rising cell from being
 //! processed twice in a tick (the same guard fire relies on).
 
 use super::{Material, MaterialInfo, EMPTY, RAIN};
+use crate::behaviors;
 use crate::sim::Simulation;
 
 pub struct Cloud;
@@ -19,13 +21,8 @@ pub struct Cloud;
 /// a painted cloud produces a steady drizzle rather than a solid sheet.
 const DRIP_RARITY: u32 = 40;
 
-/// Chance per tick (`1/this`) that a cell steps one cell downwind. Small, so the
-/// cloud creeps across the sky over many seconds rather than sliding visibly.
-const DRIFT_RARITY: u32 = 12;
-
-/// Chance per tick (`1/this`) that a cell bobs upward one cell. Rarer than the
-/// sideways drift, so the motion reads as a gentle rise riding a mostly
-/// horizontal wind.
+/// Chance per tick (`1/this`) that a cell bobs upward one cell. Keeps clouds
+/// loitering high as they ride the mostly-horizontal wind.
 const RISE_RARITY: u32 = 60;
 
 impl Material for Cloud {
@@ -50,19 +47,11 @@ impl Material for Cloud {
             sim.set(x, y + 1, RAIN);
         }
 
-        // Drift downwind. `wind` is +1/-1, flipped on a timer by the sim.
-        if sim.chance(DRIFT_RARITY) {
-            let nx = x as i32 + sim.wind();
-            if nx < 0 || nx as usize >= sim.width {
-                // Blown off the edge of the world: the cloud drifts away and is
-                // gone, one cell at a time, the way a cloud leaves the frame.
-                sim.set(x, y, EMPTY);
-                return;
-            }
-            if sim.try_move(x, y, nx as usize, y) {
-                return;
-            }
-        }
+        // Ride the wind. `escape: true` lets a cloud blown off the side drift
+        // away for good rather than piling against the wall.
+        let Some((x, y)) = behaviors::drift(sim, x, y, true) else {
+            return;
+        };
 
         // Bob gently upward.
         if y > 0 && sim.chance(RISE_RARITY) {

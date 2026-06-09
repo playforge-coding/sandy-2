@@ -3,7 +3,9 @@
 //! Fire has no fuel of its own: every tick it has a chance to gutter out and
 //! vanish, so a flame lives only a handful of ticks unless something keeps
 //! re-lighting it (oil igniting its neighbours, lava spitting fresh flames).
-//! While it burns it drifts upward via the shared [`behaviors::gas`] motion.
+//! While it burns it drifts upward via the shared [`behaviors::gas`] motion, and
+//! leans and travels on the wind via [`behaviors::drift`] — so a gust visibly
+//! bends a flame and can carry it across a gap onto fresh fuel.
 
 use super::{Material, MaterialInfo, EMPTY};
 use crate::behaviors;
@@ -34,6 +36,11 @@ impl Material for Fire {
             sim.set(x, y, EMPTY);
             return;
         }
+        // Lean and travel on the wind before doing its own rising. A flame blown
+        // off the edge just stops at the wall (`escape: false`).
+        let Some((x, y)) = behaviors::drift(sim, x, y, false) else {
+            return;
+        };
         // A flame doesn't climb in a dead-straight line: every few ticks it
         // licks sideways even when the air above is wide open, which is what
         // gives fire its flickering, wandering look. `gas` only ever steps

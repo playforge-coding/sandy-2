@@ -24,6 +24,16 @@ struct Cell {
     /// Frozen-at-spawn randomness, used only for colour jitter so a cell's
     /// grain doesn't shimmer as it moves.
     variant: u8,
+    /// Per-cell momentum, in [`VEL_UNIT`] sub-units per tick (`+x` = right, `+y`
+    /// = down). Most motion in this sim is rule-based (sand tries down, water
+    /// spreads sideways), but wind-borne cells carry a real velocity so a gust
+    /// pushes them and they keep coasting for a moment after it drops — that
+    /// inertia is what makes blown flames and slanting rain read as wind rather
+    /// than teleportation. [`crate::behaviors::drift`] integrates it; cells that
+    /// don't ride the wind simply leave it at zero. Velocity travels with the
+    /// particle automatically because [`Simulation::try_move`] swaps whole cells.
+    vx: i8,
+    vy: i8,
     /// Frame on which this cell last moved. The bottom-to-top scan skips a cell
     /// that already moved this tick, so a particle is processed at most once —
     /// without this, a *rising* particle (gas/fire) would be re-encountered by
@@ -31,21 +41,39 @@ struct Cell {
     ///
     /// Truncated to `u32` (compared against `frame as u32`) so `Cell` packs into
     /// 8 bytes instead of 16 — halving the grid's memory footprint and the
-    /// bandwidth of every scan, swap, and render. The counter only ever needs to
-    /// match *this* tick's frame, so the ~2-year wrap at 60 fps is harmless.
+    /// bandwidth of every scan, swap, and render. (`mat`, `variant`, `vx`, `vy`
+    /// fill the four bytes before it, so the velocity fields are free — they ride
+    /// in space the struct's 4-byte alignment was padding out anyway.) The
+    /// counter only ever needs to match *this* tick's frame, so the ~2-year wrap
+    /// at 60 fps is harmless.
     moved: u32,
 }
 
 const VOID: Cell = Cell {
     mat: EMPTY,
     variant: 0,
+    vx: 0,
+    vy: 0,
     moved: 0,
 };
 
-/// How many ticks the wind blows one way before it reverses. At roughly 60
-/// ticks a second (the redraw loop in `crate::app`), this is about half a
-/// minute — long enough that a gust feels like weather rather than a flicker.
-const WIND_PERIOD: u64 = 1800;
+/// Velocity fixed-point: this many sub-units make one cell per tick. A cell's
+/// `vx`/`vy` (an `i8`) therefore span roughly ±4 cells/tick — ample for a
+/// wind-blown sand pixel — while still resolving sub-cell speeds, which
+/// [`crate::behaviors::drift`] turns into the occasional whole-cell hop.
+pub(crate) const VEL_UNIT: i32 = 32;
+
+/// Peak strength of the prevailing ambient breeze, in velocity sub-units. Kept
+/// gentle — a fraction of a cell per tick — so the default weather nudges
+/// clouds across the sky and leans flames without flinging anything about. The
+/// wind *tool* layers much stronger, local gusts on top of this.
+const AMBIENT_MAX: i32 = 6;
+
+/// Angular rate of the ambient breeze's oscillation, in radians per tick. The
+/// breeze eases through a full reverse-and-back cycle every `2π / this` ticks
+/// (~40 s at 60 fps) — a smooth sine rather than the old hard flip, so the wind
+/// swells and slackens like real weather.
+const AMBIENT_RATE: f32 = 0.0026;
 
 pub struct Simulation {
     pub width: usize,
@@ -54,11 +82,22 @@ pub struct Simulation {
     frame: u64,
     /// xorshift state for cheap, dependency-free randomness.
     rng: u32,
-    /// Prevailing wind direction: `-1` blows left, `+1` blows right. It flips
-    /// every [`WIND_PERIOD`] ticks — the whole "wind system" is just this one
-    /// variable getting negated on a timer (see [`Simulation::step`]). Clouds
-    /// read it to decide which way to drift.
-    wind: i32,
+    /// The wind system, part one: a smoothly-oscillating *ambient* breeze,
+    /// horizontal only, refreshed once per tick (see [`Simulation::update_wind`]).
+    /// This is the default weather every wind-borne cell feels everywhere.
+    ambient_x: i32,
+    /// The wind system, part two: a per-cell *gust* field the wind tool paints
+    /// into (in velocity sub-units, `+x` = right / `+y` = down). It decays back
+    /// toward calm every tick so a gust fades like a real one. The effective
+    /// wind a cell rides is this plus the ambient breeze — see [`wind_at`].
+    ///
+    /// [`wind_at`]: Simulation::wind_at
+    wind_x: Vec<i8>,
+    wind_y: Vec<i8>,
+    /// Dirty flag: true while any gust is still non-zero. Lets the per-tick decay
+    /// sweep (and the cost of touching the whole field) be skipped entirely on a
+    /// calm world, which is the common case.
+    gust_active: bool,
     /// Per-id [`MaterialInfo`] cache, indexed by [`MaterialId`]. Looking a
     /// material up in the registry costs a `thread_local` + `RefCell` borrow and
     /// a dynamic call; doing that per cell in the hot `try_move`/`render_into`
@@ -76,7 +115,10 @@ impl Simulation {
             cells: vec![VOID; GRID_W * GRID_H],
             frame: 0,
             rng: 0x9E37_79B9,
-            wind: 1,
+            ambient_x: 0,
+            wind_x: vec![0; GRID_W * GRID_H],
+            wind_y: vec![0; GRID_W * GRID_H],
+            gust_active: false,
             infos: Self::snapshot_infos(),
         }
     }
@@ -90,11 +132,61 @@ impl Simulation {
             .collect()
     }
 
-    /// The current prevailing wind direction (`-1` left, `+1` right). Materials
-    /// that drift on the wind (clouds) read this each tick.
+    /// The effective wind at a cell, in velocity sub-units (`+x` = right, `+y` =
+    /// down): the ambient breeze plus any local gust painted by the wind tool.
+    /// Wind-borne materials sample this and ease their velocity toward it (see
+    /// [`crate::behaviors::drift`]).
     #[inline]
-    pub(crate) fn wind(&self) -> i32 {
-        self.wind
+    pub(crate) fn wind_at(&self, x: usize, y: usize) -> (i32, i32) {
+        let i = self.idx(x, y);
+        (
+            self.ambient_x + self.wind_x[i] as i32,
+            self.wind_y[i] as i32,
+        )
+    }
+
+    /// A cell's stored velocity, in sub-units ([`VEL_UNIT`] per cell/tick).
+    #[inline]
+    pub(crate) fn velocity(&self, x: usize, y: usize) -> (i32, i32) {
+        let c = &self.cells[self.idx(x, y)];
+        (c.vx as i32, c.vy as i32)
+    }
+
+    /// Overwrite a cell's velocity, saturating to the `i8` range it's stored in.
+    #[inline]
+    pub(crate) fn set_velocity(&mut self, x: usize, y: usize, vx: i32, vy: i32) {
+        let i = self.idx(x, y);
+        let clamp = |v: i32| v.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
+        self.cells[i].vx = clamp(vx);
+        self.cells[i].vy = clamp(vy);
+    }
+
+    /// Paint a gust into a filled circle — the wind tool's stroke. Adds
+    /// `(dvx, dvy)` sub-units to every cell in range (saturating) and arms the
+    /// per-tick decay sweep. A zero gust is a no-op so a still cursor blows
+    /// nothing.
+    pub fn add_wind_disk(&mut self, cx: i32, cy: i32, radius: i32, dvx: i32, dvy: i32) {
+        if dvx == 0 && dvy == 0 {
+            return;
+        }
+        let clamp = |v: i32| v.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
+        let r2 = radius * radius;
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                if dx * dx + dy * dy > r2 {
+                    continue;
+                }
+                let x = cx + dx;
+                let y = cy + dy;
+                if x < 0 || y < 0 || x as usize >= self.width || y as usize >= self.height {
+                    continue;
+                }
+                let i = self.idx(x as usize, y as usize);
+                self.wind_x[i] = clamp(self.wind_x[i] as i32 + dvx);
+                self.wind_y[i] = clamp(self.wind_y[i] as i32 + dvy);
+            }
+        }
+        self.gust_active = true;
     }
 
     #[inline]
@@ -134,6 +226,16 @@ impl Simulation {
     #[inline]
     pub(crate) fn chance(&mut self, n: u32) -> bool {
         self.rand() % n.max(1) == 0
+    }
+
+    /// True with probability `num/den` — the finer-grained cousin of [`chance`].
+    /// Used to turn a sub-cell velocity into the occasional whole-cell hop: a
+    /// speed of 0.3 cells/tick steps one cell roughly three times in ten.
+    ///
+    /// [`chance`]: Simulation::chance
+    #[inline]
+    pub(crate) fn rand_ratio(&mut self, num: u32, den: u32) -> bool {
+        self.rand() % den.max(1) < num
     }
 
     /// Try to move/swap the cell at `(sx,sy)` into `(tx,ty)`, if the source can
@@ -193,6 +295,10 @@ impl Simulation {
         self.cells[i] = Cell {
             mat,
             variant,
+            // A freshly-spawned cell starts at rest; it picks up momentum from
+            // the wind on the ticks that follow.
+            vx: 0,
+            vy: 0,
             moved: 0,
         };
     }
@@ -219,6 +325,8 @@ impl Simulation {
                     self.cells[i] = Cell {
                         mat,
                         variant,
+                        vx: 0,
+                        vy: 0,
                         moved: 0,
                     };
                 }
@@ -230,15 +338,40 @@ impl Simulation {
         for c in self.cells.iter_mut() {
             *c = VOID;
         }
+        // Wipe the weather too: a cleared world should be dead calm.
+        self.wind_x.iter_mut().for_each(|v| *v = 0);
+        self.wind_y.iter_mut().for_each(|v| *v = 0);
+        self.gust_active = false;
+    }
+
+    /// Advance the wind one tick: refresh the ambient breeze and fade any gusts.
+    fn update_wind(&mut self) {
+        // The prevailing breeze eases through a smooth sine — swelling, dropping,
+        // and gently reversing — rather than snapping direction on a timer.
+        self.ambient_x = (AMBIENT_MAX as f32 * (self.frame as f32 * AMBIENT_RATE).sin()) as i32;
+
+        // Relax painted gusts back toward calm. Exponential-ish (shed an eighth
+        // of the magnitude) but always by at least one unit, so a gust actually
+        // reaches zero instead of crawling there forever. Skipped wholesale when
+        // nothing is blowing.
+        if self.gust_active {
+            let mut any = false;
+            for v in self.wind_x.iter_mut().chain(self.wind_y.iter_mut()) {
+                if *v != 0 {
+                    let step = ((*v as i32).abs() / 8).max(1) as i8;
+                    *v -= v.signum() * step;
+                    any |= *v != 0;
+                }
+            }
+            self.gust_active = any;
+        }
     }
 
     /// Advance the world by one tick.
     pub fn step(&mut self) {
         self.frame = self.frame.wrapping_add(1);
-        // The entire wind system: reverse direction once per period.
-        if self.frame % WIND_PERIOD == 0 {
-            self.wind = -self.wind;
-        }
+        // Advance the weather: ambient breeze plus decaying tool-painted gusts.
+        self.update_wind();
         // Refresh the per-id info cache for this tick's hot paths (`try_move`,
         // and `render_into` which runs right after). Cheap: one entry per
         // material, and it picks up any plugin registered since last tick.
@@ -309,6 +442,7 @@ mod tests {
     const LAVA: MaterialId = 4;
     const OIL: MaterialId = 5;
     const FIRE: MaterialId = 6;
+    const CLOUD: MaterialId = 10;
 
     #[test]
     fn sand_falls_to_the_floor() {
@@ -447,6 +581,90 @@ mod tests {
             }
         }
         assert!(saw_fire, "lava should give off fire over time");
+    }
+
+    #[test]
+    fn wind_carries_a_cloud_downwind() {
+        // A cloud sitting in still air, under a steady rightward gust, should
+        // ride that wind well clear of where it started.
+        let mut sim = Simulation::new();
+        let (start_x, y) = (10, 20);
+        sim.set(start_x, y, CLOUD);
+        for _ in 0..40 {
+            // Re-paint a wide rightward gust over the cloud's path each tick so
+            // it doesn't decay out from under the cloud as it travels.
+            sim.add_wind_disk(100, y as i32, 120, 90, 0);
+            sim.step();
+        }
+        let cloud_x = (0..GRID_W)
+            .find(|&gx| (0..GRID_H).any(|gy| sim.mat_at(gx, gy) == CLOUD))
+            .expect("cloud should still be somewhere in the world");
+        assert!(
+            cloud_x > start_x + 2,
+            "wind should carry the cloud right, ended at x={cloud_x}"
+        );
+    }
+
+    #[test]
+    fn a_blown_cell_keeps_coasting_after_the_gust() {
+        // Momentum: give a cloud a hard rightward shove for a few ticks, then let
+        // the wind go calm. It should keep gliding right for a tick or two on the
+        // velocity it built up, rather than stopping dead.
+        let mut sim = Simulation::new();
+        let (start_x, y) = (40, 20);
+        sim.set(start_x, y, CLOUD);
+        // Build up rightward momentum.
+        for _ in 0..6 {
+            sim.add_wind_disk(start_x as i32, y as i32, 60, 110, 0);
+            sim.step();
+        }
+        let after_gust = (0..GRID_W)
+            .find(|&gx| (0..GRID_H).any(|gy| sim.mat_at(gx, gy) == CLOUD))
+            .expect("cloud exists after the gust");
+        // Now no more wind painted — let it coast (ambient is gentle and may
+        // wander, so only a couple of ticks before it bleeds off).
+        for _ in 0..3 {
+            sim.step();
+        }
+        let coasted = (0..GRID_W)
+            .find(|&gx| (0..GRID_H).any(|gy| sim.mat_at(gx, gy) == CLOUD))
+            .expect("cloud exists while coasting");
+        assert!(
+            coasted >= after_gust,
+            "cloud should coast on its momentum, went {after_gust} -> {coasted}"
+        );
+    }
+
+    #[test]
+    fn calm_air_never_nudges_settled_sand_sideways() {
+        // Sand isn't wind-borne, so even with the ambient breeze blowing for a
+        // long time a grain resting on the floor must not creep sideways. Guards
+        // against accidentally wiring the velocity system into heavy materials.
+        let mut sim = Simulation::new();
+        let x = 10;
+        sim.set(x, GRID_H - 1, SAND);
+        for _ in 0..600 {
+            sim.step();
+        }
+        assert_eq!(sim.mat_at(x, GRID_H - 1), SAND);
+    }
+
+    #[test]
+    fn gusts_fade_back_to_calm() {
+        // A painted gust should decay away on its own over time, leaving the
+        // field (and the dirty flag) calm again.
+        let mut sim = Simulation::new();
+        sim.add_wind_disk(50, 50, 10, 120, -120);
+        assert!(sim.gust_active, "painting wind should arm the decay sweep");
+        for _ in 0..200 {
+            sim.step();
+        }
+        assert!(!sim.gust_active, "gust should have fully decayed");
+        assert_eq!(
+            sim.wind_at(50, 50),
+            (sim.ambient_x, 0),
+            "no gust should remain"
+        );
     }
 
     #[test]

@@ -33,6 +33,11 @@ pub enum UserEvent {
 struct Input {
     cursor: (f64, f64),
     drawing: bool,
+    /// Grid cell the wind tool was at on the previous painted frame, so a drag
+    /// yields a direction (this → now). `None` at the start of a stroke (and for
+    /// the paint tool), so the first frame only seeds the position and blows
+    /// nothing.
+    last_wind: Option<(i32, i32)>,
     controls: ui::Controls,
 }
 
@@ -41,10 +46,16 @@ impl Default for Input {
         Self {
             cursor: (0.0, 0.0),
             drawing: false,
+            last_wind: None,
             controls: ui::Controls::default(),
         }
     }
 }
+
+/// Sub-units of wind added per grid cell the cursor sweeps (see
+/// [`crate::sim::Simulation::add_wind_disk`]). A brisk flick saturates the gust
+/// field for a strong, short-lived blast; a slow drag nudges gently.
+const WIND_DRAG_GAIN: i32 = 6;
 
 struct App {
     // Only consumed on the web (the async-init handoff); unused on native.
@@ -183,6 +194,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if btn == ElementState::Pressed {
                     // Start painting only if egui didn't take the click.
                     self.input.drawing = !consumed;
+                    self.input.last_wind = None; // a fresh stroke has no direction yet
                 } else {
                     self.input.drawing = false;
                 }
@@ -196,7 +208,10 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Touch(touch) => {
                 self.input.cursor = (touch.location.x, touch.location.y);
                 match touch.phase {
-                    TouchPhase::Started => self.input.drawing = !consumed,
+                    TouchPhase::Started => {
+                        self.input.drawing = !consumed;
+                        self.input.last_wind = None; // fresh stroke, no direction yet
+                    }
                     TouchPhase::Moved => {} // keep painting; cursor already updated
                     TouchPhase::Ended | TouchPhase::Cancelled => self.input.drawing = false,
                 }
@@ -234,13 +249,29 @@ impl App {
             return;
         }
 
-        // Paint under the cursor while the mouse is held.
+        // Paint (or blow wind) under the cursor while the mouse is held.
         if self.input.drawing {
-            let brush = self.input.controls.brush;
-            let material = self.input.controls.material;
+            let controls = &self.input.controls;
+            let brush = controls.brush;
             let state = self.state.as_mut().unwrap();
             let (gx, gy) = state.cursor_to_grid(self.input.cursor);
-            state.sim.paint_disk(gx, gy, brush, material);
+            match controls.tool {
+                ui::Tool::Paint => {
+                    state.sim.paint_disk(gx, gy, brush, controls.material);
+                }
+                ui::Tool::Wind => {
+                    // Blow a gust in the direction the cursor swept since last
+                    // frame. The first frame of a stroke just seeds the position.
+                    if let Some((px, py)) = self.input.last_wind {
+                        let dvx = (gx - px) * WIND_DRAG_GAIN;
+                        let dvy = (gy - py) * WIND_DRAG_GAIN;
+                        // A little heft so even a small brush makes a felt gust.
+                        let radius = brush.max(5);
+                        state.sim.add_wind_disk(gx, gy, radius, dvx, dvy);
+                    }
+                    self.input.last_wind = Some((gx, gy));
+                }
+            }
         }
 
         // Run egui for this frame. The window handle is cloned so it doesn't tie
@@ -289,6 +320,24 @@ impl App {
 
     fn handle_key(&mut self, code: KeyCode) {
         let c = &mut self.input.controls;
+        // Selecting any material (the digit keys) implies the paint tool — set it
+        // once here so each arm needn't repeat it.
+        if matches!(
+            code,
+            KeyCode::Digit1
+                | KeyCode::Digit2
+                | KeyCode::Digit3
+                | KeyCode::Digit4
+                | KeyCode::Digit5
+                | KeyCode::Digit6
+                | KeyCode::Digit7
+                | KeyCode::Digit8
+                | KeyCode::Digit9
+                | KeyCode::Digit0
+                | KeyCode::Backspace
+        ) {
+            c.tool = ui::Tool::Paint;
+        }
         match code {
             // Material selection. These ids match the registry order in
             // `materials::builtins`.
@@ -302,6 +351,8 @@ impl App {
             KeyCode::Digit8 => c.material = 8, // Wood
             KeyCode::Digit9 => c.material = 9, // Leaves
             KeyCode::Digit0 | KeyCode::Backspace => c.material = EMPTY, // Eraser
+            // Wind tool: sweep the cursor to blow a gust.
+            KeyCode::KeyW => c.tool = ui::Tool::Wind,
             // Brush size.
             KeyCode::BracketLeft => c.brush = (c.brush - 1).max(0),
             KeyCode::BracketRight => c.brush = (c.brush + 1).min(40),
@@ -357,7 +408,7 @@ pub fn run() {
     }
 
     log::info!(
-        "Controls: use the panel, or press 1=Sand 2=Stone 3=Water 4=Lava 5=Oil 6=Fire 7=Soil 8=Wood 9=Leaves  0/Backspace=Erase  [ ]=brush size  C=clear  G=generate world  R=random seed  (hold left mouse to draw)  — drag a .rhai file onto the window to add a material"
+        "Controls: use the panel, or press 1=Sand 2=Stone 3=Water 4=Lava 5=Oil 6=Fire 7=Soil 8=Wood 9=Leaves  0/Backspace=Erase  W=wind tool (sweep to blow a gust)  [ ]=brush size  C=clear  G=generate world  R=random seed  (hold left mouse to draw)  — drag a .rhai file onto the window to add a material"
     );
 
     let event_loop = EventLoop::<UserEvent>::with_user_event()

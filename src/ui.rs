@@ -15,13 +15,28 @@ use crate::materials::{self, MaterialId};
 /// Longest seed the user can type — keeps the value comfortably within `u32`.
 const MAX_SEED_DIGITS: usize = 7;
 
+/// What the brush does when the user drags. Most of the time it paints the
+/// selected material; the wind tool instead blows a gust in the drag direction
+/// (see [`crate::sim::Simulation::add_wind_disk`]) without placing any cells.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Tool {
+    /// Paint the selected [`Controls::material`].
+    Paint,
+    /// Blow wind the way the cursor is swept.
+    Wind,
+}
+
 /// Control state shared between the egui panel and the keyboard shortcuts in
 /// [`crate::app`]. egui reads and writes it in place each frame; `app` pokes the
 /// same fields from key handlers.
 pub struct Controls {
-    /// Material the brush paints with.
+    /// What a drag does — paint, or blow wind.
+    pub tool: Tool,
+    /// Material the brush paints with (when [`tool`] is [`Tool::Paint`]).
+    ///
+    /// [`tool`]: Controls::tool
     pub material: MaterialId,
-    /// Brush radius, in grid cells.
+    /// Brush radius, in grid cells. Doubles as the wind tool's gust radius.
     pub brush: i32,
     /// The world seed, as text so it can be edited in a box. Parsed to a `u32`
     /// when a world is actually built (see [`Controls::seed_value`]).
@@ -31,6 +46,7 @@ pub struct Controls {
 impl Default for Controls {
     fn default() -> Self {
         Self {
+            tool: Tool::Paint,
             material: 1, // Sand
             brush: 4,
             seed: crate::worldgen::DEFAULT_SEED.to_string(),
@@ -98,16 +114,34 @@ pub fn draw(ctx: &egui::Context, c: &mut Controls) -> Actions {
                 let mut btn = egui::Button::new(RichText::new(info.name).color(contrast(fill)))
                     .fill(fill)
                     .min_size(button_size);
-                if id == c.material {
+                // Highlight the active material only while the paint tool is the
+                // one in use, so it's clear at a glance whether a drag paints.
+                if id == c.material && c.tool == Tool::Paint {
                     btn = btn.stroke(Stroke::new(2.0, Color32::WHITE));
                 }
                 if ui.add(btn).clicked() {
                     c.material = id;
+                    c.tool = Tool::Paint; // picking a material returns to painting
                 }
             }
 
             ui.separator();
-            ui.add(egui::Slider::new(&mut c.brush, 0..=40).text("Brush"));
+            // The wind tool: sweep the cursor to blow a gust that way.
+            let mut wind_btn = egui::Button::new("💨 Wind").min_size(button_size);
+            if c.tool == Tool::Wind {
+                wind_btn = wind_btn.stroke(Stroke::new(2.0, Color32::WHITE));
+            }
+            if ui.add(wind_btn).clicked() {
+                c.tool = Tool::Wind;
+            }
+
+            ui.separator();
+            let brush_label = if c.tool == Tool::Wind {
+                "Gust size"
+            } else {
+                "Brush"
+            };
+            ui.add(egui::Slider::new(&mut c.brush, 0..=40).text(brush_label));
 
             ui.separator();
             ui.horizontal(|ui| {
@@ -131,9 +165,12 @@ pub fn draw(ctx: &egui::Context, c: &mut Controls) -> Actions {
 
             ui.separator();
             ui.label(
-                RichText::new("Hold left-mouse to draw · drag a .rhai file to add a material")
-                    .small()
-                    .weak(),
+                RichText::new(
+                    "Hold left-mouse to draw · pick Wind and sweep to blow a gust · \
+                     drag a .rhai file to add a material",
+                )
+                .small()
+                .weak(),
             );
         });
 
