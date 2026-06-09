@@ -84,8 +84,14 @@ pub struct EntityState {
     /// A free-running per-creature clock, incremented each tick. Behaviours use
     /// it to pace themselves (an ant steps every few ticks, not every one).
     pub timer: u32,
+    /// How peckish the creature is, climbing each tick it goes unfed. A forager
+    /// (see [`behaviors::graze`]/[`behaviors::hunt`]) starts looking for food once
+    /// this passes a threshold, resets it to zero when it eats, and is reaped if
+    /// it climbs all the way to starvation. Creatures with no appetite simply
+    /// never consult it.
+    pub hunger: u16,
     /// Cleared by a behaviour to have the creature reaped at the end of the tick
-    /// (an ant that wandered into water drowns).
+    /// (an ant that wandered into water drowns, or one that starved).
     pub alive: bool,
 }
 
@@ -100,6 +106,7 @@ impl EntityState {
             vy: 0.0,
             dir,
             timer: 0,
+            hunger: 0,
             alive: true,
         }
     }

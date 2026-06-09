@@ -554,31 +554,110 @@ impl Simulation {
         (e.x, e.y)
     }
 
-    /// Advance every creature one tick. The live set is moved out for the
-    /// duration so a creature's `update` can borrow `&mut Simulation` freely (and
-    /// even spawn more — a fresh creature lands in `self.entities` while the
-    /// in-flight set is held aside, then is folded back in below). Each creature's
-    /// small state is copied out, advanced, and written back; dead ones are reaped.
+    /// How many cells currently hold `mat`. Test-only.
+    #[cfg(test)]
+    pub(crate) fn count_mat(&self, mat: MaterialId) -> usize {
+        self.cells.iter().filter(|c| c.mat == mat).count()
+    }
+
+    /// Advance every creature one tick. Each creature's small state is *copied*
+    /// out by index, advanced against `&mut Simulation`, then written back; the
+    /// live list itself stays in place throughout, so a creature can sense the
+    /// others through it — which is what lets a predator hunt its prey (see
+    /// [`nearest_entity`](Self::nearest_entity)). Creatures spawned mid-tick land
+    /// past `n` and so wait for the next tick; dead ones are reaped at the end.
     fn step_entities(&mut self) {
         if self.entities.is_empty() {
             return;
         }
-        let mut ents = std::mem::take(&mut self.entities);
-        for i in 0..ents.len() {
-            if !ents[i].alive {
+        let n = self.entities.len();
+        for i in 0..n {
+            if !self.entities[i].alive {
                 continue;
             }
-            let mut e = ents[i];
+            let mut e = self.entities[i];
             entities::get(e.kind).update(self, &mut e);
-            ents[i] = e;
+            // A predator that ran earlier this tick may have eaten this creature
+            // (marking its live-list slot dead) while it was thinking; honour that
+            // kill rather than writing the now-stale live copy back over it.
+            if self.entities[i].alive {
+                self.entities[i] = e;
+            }
         }
-        ents.retain(|e| e.alive);
-        // `self.entities` now holds anything spawned during this tick; merge it.
-        ents.append(&mut self.entities);
-        if ents.len() > MAX_ENTITIES {
-            ents.truncate(MAX_ENTITIES);
+        self.entities.retain(|e| e.alive);
+        if self.entities.len() > MAX_ENTITIES {
+            self.entities.truncate(MAX_ENTITIES);
         }
-        self.entities = ents;
+    }
+
+    /// The nearest live creature whose kind is in `kinds`, within `radius` cells
+    /// of `(x, y)`, as `(index, dx, dy)` — `dx`/`dy` point from the searcher to
+    /// the prey. A predator senses prey through the same `sim` its movement uses.
+    ///
+    /// While a creature is being advanced it still sits in the live list as a
+    /// stale copy of itself (see [`step_entities`](Self::step_entities)), so a
+    /// creature must never list its *own* kind as prey — it would find and eat
+    /// itself. Different-kind prey is excluded automatically.
+    pub(crate) fn nearest_entity(
+        &self,
+        x: f32,
+        y: f32,
+        kinds: &[EntityKindId],
+        radius: f32,
+    ) -> Option<(usize, f32, f32)> {
+        let r2 = radius * radius;
+        let mut best: Option<(usize, f32, f32, f32)> = None; // (index, dx, dy, dist²)
+        for (i, e) in self.entities.iter().enumerate() {
+            if !e.alive || !kinds.contains(&e.kind) {
+                continue;
+            }
+            let (dx, dy) = (e.x - x, e.y - y);
+            let d2 = dx * dx + dy * dy;
+            if d2 <= r2 && best.map_or(true, |(_, _, _, bd2)| d2 < bd2) {
+                best = Some((i, dx, dy, d2));
+            }
+        }
+        best.map(|(i, dx, dy, _)| (i, dx, dy))
+    }
+
+    /// The nearest cell holding one of `mats` within `radius` cells of `(x, y)`,
+    /// as `(cx, cy)`. A grazer uses it to spot food in the terrain around it;
+    /// closest-by-squared-distance wins, searching a square window clipped to the
+    /// world.
+    pub(crate) fn nearest_cell(
+        &self,
+        x: i32,
+        y: i32,
+        mats: &[MaterialId],
+        radius: i32,
+    ) -> Option<(usize, usize)> {
+        let r2 = radius * radius;
+        let mut best: Option<(usize, usize, i32)> = None; // (cx, cy, dist²)
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                let d2 = dx * dx + dy * dy;
+                if d2 > r2 {
+                    continue;
+                }
+                let (nx, ny) = (x + dx, y + dy);
+                if nx < 0 || ny < 0 || nx as usize >= self.width || ny as usize >= self.height {
+                    continue;
+                }
+                let m = self.cells[self.idx(nx as usize, ny as usize)].mat;
+                if mats.contains(&m) && best.map_or(true, |(_, _, bd2)| d2 < bd2) {
+                    best = Some((nx as usize, ny as usize, d2));
+                }
+            }
+        }
+        best.map(|(cx, cy, _)| (cx, cy))
+    }
+
+    /// Reap creature `i` — used when a predator eats it. A no-op for an
+    /// out-of-range index or an already-dead creature.
+    pub(crate) fn reap_entity(&mut self, i: usize) {
+        if let Some(e) = self.entities.get_mut(i) {
+            e.alive = false;
+        }
     }
 }
 
@@ -657,6 +736,100 @@ mod tests {
             x >= 0.0 && x < GRID_W as f32,
             "bird should stay within the world"
         );
+    }
+
+    #[test]
+    fn a_hungry_ant_eats_the_leaves_it_finds() {
+        // An ant on a bed of leaves, once peckish, browses them — so the foliage
+        // around it dwindles while the ant itself lives on, well fed.
+        const LEAVES: MaterialId = 9;
+        let mut sim = Simulation::new();
+        let floor = GRID_H - 1;
+        let band = 90..110;
+        for x in band.clone() {
+            sim.set(x, floor, STONE); // ground to stand on
+            sim.set(x, floor - 1, LEAVES); // food to graze
+        }
+        let leaves_before = sim.count_mat(LEAVES);
+        sim.spawn_entity(ANT, 100, floor as i32 - 1);
+
+        for _ in 0..400 {
+            sim.step();
+        }
+
+        assert_eq!(sim.entity_count(), 1, "a fed ant should still be alive");
+        assert!(
+            sim.count_mat(LEAVES) < leaves_before,
+            "the ant should have eaten some of the leaves"
+        );
+    }
+
+    #[test]
+    fn a_hungry_bird_eats_an_ant() {
+        // A bird wheeling over a floor crawling with ants turns predator once
+        // hungry, diving to snatch one up — so the population thins.
+        let mut sim = Simulation::new();
+        let floor = GRID_H - 1;
+        for x in 0..GRID_W {
+            sim.set(x, floor, STONE);
+        }
+        let mut ants = 0;
+        for x in (60..160).step_by(5) {
+            sim.spawn_entity(ANT, x as i32, floor as i32 - 1);
+            ants += 1;
+        }
+        sim.spawn_entity(BIRD, 100, 30);
+        assert_eq!(sim.entity_count(), ants + 1);
+
+        for _ in 0..1500 {
+            sim.step();
+        }
+
+        assert!(
+            sim.entity_count() < ants + 1,
+            "the bird should have eaten at least one ant"
+        );
+    }
+
+    #[test]
+    fn a_well_fed_ant_breeds() {
+        // An ant turned loose on a deep bed of leaves eats its fill and multiplies,
+        // so a lone forager becomes a colony.
+        const LEAVES: MaterialId = 9;
+        let mut sim = Simulation::new();
+        let floor = GRID_H - 1;
+        for x in 40..160 {
+            sim.set(x, floor, STONE);
+            for y in (floor - 8)..floor {
+                sim.set(x, y, LEAVES);
+            }
+        }
+        sim.spawn_entity(ANT, 100, floor as i32 - 9);
+
+        for _ in 0..1500 {
+            sim.step();
+        }
+
+        assert!(
+            sim.entity_count() > 1,
+            "an ant with plenty to eat should have bred, got {}",
+            sim.entity_count()
+        );
+    }
+
+    #[test]
+    fn a_creature_starves_with_nothing_to_eat() {
+        // An ant on bare stone, with no leaves anywhere, eventually starves.
+        let mut sim = Simulation::new();
+        let floor = GRID_H - 1;
+        for x in 0..GRID_W {
+            sim.set(x, floor, STONE);
+        }
+        sim.spawn_entity(ANT, 100, floor as i32 - 1);
+        for _ in 0..2100 {
+            sim.step();
+        }
+        assert_eq!(sim.entity_count(), 0, "an ant with no food should starve");
     }
 
     #[test]
