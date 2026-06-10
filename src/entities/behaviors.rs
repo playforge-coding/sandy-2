@@ -10,7 +10,7 @@
 //! behaviours use (`cell_mat`, `chance`, `rand_f32`), so they never need to know
 //! how the grid is stored.
 
-use crate::materials::{MaterialId, ALGAE, EMPTY, LAVA, OIL, WATER};
+use crate::materials::{MaterialId, ALGAE, CLOUD, EMPTY, FIRE, LAVA, LEAVES, OIL, WATER};
 use crate::sim::Simulation;
 
 use super::{EntityKindId, EntityState};
@@ -18,6 +18,26 @@ use super::{EntityKindId, EntityState};
 /// Liquids a land creature drowns or burns in if it ends up standing in one.
 fn is_liquid(m: MaterialId) -> bool {
     matches!(m, WATER | LAVA | OIL)
+}
+
+/// Molten lava and open flame: the hazards that kill *any* creature outright,
+/// whatever element it lives in. Water and oil only drown a land-dweller (a fish
+/// is at home in water), so they're handled separately by the walker — but a bird
+/// in the flames or a fish flung into lava dies just the same.
+fn lethal(m: MaterialId) -> bool {
+    matches!(m, LAVA | FIRE)
+}
+
+/// Reap the creature if it's sitting in lava or fire. Returns `true` (so the
+/// caller bails out of the rest of its turn) when it died. Shared by every
+/// forager, so birds, fish, and ants all perish in the heat alike.
+fn burned(sim: &Simulation, me: &mut EntityState) -> bool {
+    let (x, y) = (me.x.round() as i32, me.y.round() as i32);
+    if matches!(sim.cell_mat(x, y), Some(m) if lethal(m)) {
+        me.alive = false;
+        return true;
+    }
+    false
 }
 
 /// Whether a cell is solid footing or a wall to a creature: any filled,
@@ -30,6 +50,14 @@ fn solid(sim: &Simulation, x: i32, y: i32) -> bool {
         // Off-grid: sides and the floor block (`y >= 0`); above the top is sky.
         None => y >= 0,
     }
+}
+
+/// Whether a cell blocks a flier's path. Like [`solid`], but soft, wispy cells —
+/// a tree's leafy canopy and clouds — don't count, so a bird or breaching fish
+/// wings straight through them rather than bouncing off. (Walkers still treat
+/// leaves as solid, so an ant perches on and grazes the foliage as before.)
+fn obstacle(sim: &Simulation, x: i32, y: i32) -> bool {
+    solid(sim, x, y) && !matches!(sim.cell_mat(x, y), Some(LEAVES) | Some(CLOUD))
 }
 
 /// Ticks between an ambling creature's steps. Higher = a slower walk; moving
@@ -119,8 +147,9 @@ pub fn fly(sim: &mut Simulation, me: &mut EntityState) {
     }
     me.vy *= VY_DAMPING;
 
-    // Steer clear of the ground below and the ceiling above.
-    if (1..=GROUND_CLEARANCE).any(|d| solid(sim, x, y + d)) {
+    // Steer clear of the ground below and the ceiling above (winging through
+    // leaves, not over them).
+    if (1..=GROUND_CLEARANCE).any(|d| obstacle(sim, x, y + d)) {
         me.vy -= 0.5; // climb away from the terrain
     }
     if me.y < SKY_MARGIN {
@@ -131,7 +160,7 @@ pub fn fly(sim: &mut Simulation, me: &mut EntityState) {
     // Horizontal: turn at a side wall or any terrain straight ahead.
     let nx = me.x + me.vx;
     let ahead = nx.round() as i32;
-    if nx < 1.0 || nx >= (sim.width - 1) as f32 || solid(sim, ahead, y) {
+    if nx < 1.0 || nx >= (sim.width - 1) as f32 || obstacle(sim, ahead, y) {
         me.vx = -me.vx;
         me.dir = -me.dir;
     } else {
@@ -291,7 +320,7 @@ pub fn breed(sim: &mut Simulation, me: &EntityState) {
 /// patch sensed and walk to it. Starves if it goes too long unfed. Shared by ants
 /// and any future browser.
 pub fn graze(sim: &mut Simulation, me: &mut EntityState, diet: &Diet) {
-    if hunger_tick(me) {
+    if burned(sim, me) || hunger_tick(me) {
         return;
     }
     if me.hunger >= HUNGRY {
@@ -315,7 +344,7 @@ pub fn graze(sim: &mut Simulation, me: &mut EntityState, diet: &Diet) {
 /// Falls back to ordinary cruising when there's nothing to chase, and starves if
 /// it goes too long unfed. Shared by birds and any future aerial predator.
 pub fn hunt(sim: &mut Simulation, me: &mut EntityState, diet: &Diet) {
-    if hunger_tick(me) {
+    if burned(sim, me) || hunger_tick(me) {
         return;
     }
     if me.hunger >= HUNGRY {
@@ -347,14 +376,15 @@ fn dive(sim: &mut Simulation, me: &mut EntityState, dx: f32, dy: f32) {
 
     // Aim vertically at the prey, but pull up if terrain is close below.
     me.vy = dy.clamp(-DIVE_SPEED, DIVE_SPEED);
-    if (1..=2).any(|d| solid(sim, x, y + d)) {
+    if (1..=2).any(|d| obstacle(sim, x, y + d)) {
         me.vy = -DIVE_SPEED;
     }
 
-    // Don't plough through a wall: revert to ordinary flight if blocked ahead.
+    // Don't plough through a wall: revert to ordinary flight if blocked ahead
+    // (leaves don't count — it dives clean through the canopy after prey).
     let nx = me.x + me.vx;
     let ahead = nx.round() as i32;
-    if nx < 1.0 || nx >= (sim.width - 1) as f32 || solid(sim, ahead, y) {
+    if nx < 1.0 || nx >= (sim.width - 1) as f32 || obstacle(sim, ahead, y) {
         fly(sim, me);
         return;
     }
@@ -419,12 +449,13 @@ fn airborne(sim: &mut Simulation, me: &mut EntityState, drift_dx: f32) {
     }
     let nx = me.x + me.dir as f32 * AIR_DRIFT;
     let ahead = nx.round() as i32;
-    if nx > 1.0 && nx < (sim.width - 1) as f32 && !solid(sim, ahead, y) {
+    if nx > 1.0 && nx < (sim.width - 1) as f32 && !obstacle(sim, ahead, y) {
         me.x = nx;
     }
-    // Sink unless solid ground catches the flop.
+    // Sink unless solid ground catches the flop (soft leaves don't — it drops
+    // back through the canopy toward the pool).
     let ny = me.y + me.vy;
-    if !solid(sim, x, ny.round() as i32) {
+    if !obstacle(sim, x, ny.round() as i32) {
         me.y = ny.clamp(1.0, (sim.height - 2) as f32);
     } else {
         me.vy = 0.0;
@@ -469,7 +500,7 @@ pub fn paddle(sim: &mut Simulation, me: &mut EntityState) {
 /// surface and leaps at. Suffocates if stranded out of water, starves if unfed.
 /// Shared by fish and any future swimmer.
 pub fn swim(sim: &mut Simulation, me: &mut EntityState, diet: &Diet) {
-    if hunger_tick(me) {
+    if burned(sim, me) || hunger_tick(me) {
         return;
     }
     if me.hunger >= HUNGRY {

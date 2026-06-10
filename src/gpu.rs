@@ -18,6 +18,24 @@ use crate::sim::{Simulation, GRID_H, GRID_W};
 /// How far the glow spreads, in grid texels per blur tap. Larger = wider halo.
 const GLOW_SPREAD: f32 = 1.5;
 
+/// Rate at which the simulation advances, in ticks per second. The sim is a
+/// discrete cellular automaton, so "speed" is just how many `sim.step()`s run
+/// per second. Decoupling this from the frame rate (see [`State::update`]) is
+/// what makes the game run at the same speed everywhere: a 60 Hz monitor, a
+/// 144 Hz monitor, and a browser tab all advance the world 30 ticks per second.
+const TICKS_PER_SECOND: f64 = 30.0;
+
+/// Real seconds one simulation tick represents.
+const TICK_DT: f64 = 1.0 / TICKS_PER_SECOND;
+
+/// Upper bound on the real time a single frame may contribute to the tick
+/// accumulator. Without it, a long stall (a backgrounded tab, a debugger pause,
+/// a slow first frame) would bank a huge backlog and the next `update` would
+/// try to run hundreds of catch-up ticks at once — the classic "spiral of
+/// death". Clamping means we simply drop the missed time instead. At 0.25 s a
+/// frame can run at most 15 catch-up ticks.
+const MAX_FRAME_TIME: f64 = 0.25;
+
 pub struct State {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -47,6 +65,14 @@ pub struct State {
     /// egui's wgpu backend — turns the tessellated UI into draw calls layered
     /// over the composited scene each frame (see [`State::render`]).
     egui_renderer: egui_wgpu::Renderer,
+
+    /// Wall-clock time the previous [`State::update`] ran. The elapsed time
+    /// since drives the fixed-timestep accumulator.
+    last_update: web_time::Instant,
+    /// Leftover real time (< [`TICK_DT`]) carried into the next frame. Together
+    /// with `last_update` this decouples sim speed from the frame rate: real
+    /// elapsed time is banked here and spent one fixed `TICK_DT` step at a time.
+    tick_accumulator: f64,
 
     pub sim: Simulation,
 }
@@ -446,7 +472,32 @@ impl State {
         // Open onto a freshly-generated world rather than an empty grid.
         let mut sim = Simulation::new();
         crate::worldgen::generate(&mut sim, crate::worldgen::DEFAULT_SEED);
-        let pixels = vec![0u8; GRID_W * GRID_H * 4];
+        let mut pixels = vec![0u8; GRID_W * GRID_H * 4];
+
+        // Seed the grid texture with the generated world. `update` only re-uploads
+        // on frames that actually advance the sim, so the first few frames (before
+        // enough wall-clock time has accrued for a tick) would otherwise show an
+        // empty texture.
+        sim.render_into(&mut pixels);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &grid_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(GRID_W as u32 * 4),
+                rows_per_image: Some(GRID_H as u32),
+            },
+            wgpu::Extent3d {
+                width: GRID_W as u32,
+                height: GRID_H as u32,
+                depth_or_array_layers: 1,
+            },
+        );
 
         State {
             window,
@@ -467,6 +518,8 @@ impl State {
             glow_b_view,
             pixels,
             egui_renderer,
+            last_update: web_time::Instant::now(),
+            tick_accumulator: 0.0,
             sim,
         }
     }
@@ -508,11 +561,36 @@ impl State {
         (gx, gy)
     }
 
-    /// Advance the simulation one tick and upload the rendered grid to the GPU.
-    /// The UI is no longer stamped into the pixel buffer — egui draws it as a
-    /// separate pass in [`State::render`].
+    /// Advance the simulation by however much real time has passed, then upload
+    /// the rendered grid to the GPU. The UI is no longer stamped into the pixel
+    /// buffer — egui draws it as a separate pass in [`State::render`].
+    ///
+    /// This runs on every redraw (i.e. once per displayed frame), but the sim
+    /// itself advances on a fixed timestep: real elapsed time is banked in
+    /// `tick_accumulator` and spent in whole [`TICK_DT`] steps. So the world
+    /// always moves [`TICKS_PER_SECOND`] ticks per second of wall-clock time,
+    /// whether the display refreshes at 30, 60, or 144 Hz. A fast display just
+    /// renders the same grid more than once between ticks; a slow one runs
+    /// several catch-up ticks per frame (bounded by [`MAX_FRAME_TIME`]).
     pub fn update(&mut self) {
-        self.sim.step();
+        let now = web_time::Instant::now();
+        let frame_time = (now - self.last_update).as_secs_f64().min(MAX_FRAME_TIME);
+        self.last_update = now;
+        self.tick_accumulator += frame_time;
+
+        let mut stepped = false;
+        while self.tick_accumulator >= TICK_DT {
+            self.sim.step();
+            self.tick_accumulator -= TICK_DT;
+            stepped = true;
+        }
+
+        // Nothing changed if no tick ran (display faster than the tick rate), so
+        // the texture already holds the current grid — skip the re-render+upload.
+        if !stepped {
+            return;
+        }
+
         self.sim.render_into(&mut self.pixels);
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {

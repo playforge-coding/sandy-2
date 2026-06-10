@@ -788,7 +788,9 @@ mod tests {
         }
         sim.spawn_entity(ANT, 100, 10);
         assert_eq!(sim.entity_count(), 1);
-        for _ in 0..200 {
+        // Long enough for the ant to fall the full height of the world (it drops
+        // one cell a tick) and then pace a while on the floor it lands on.
+        for _ in 0..300 {
             sim.step();
         }
         assert_eq!(sim.entity_count(), 1, "ant on solid ground should survive");
@@ -816,6 +818,36 @@ mod tests {
         assert_eq!(sim.entity_count(), 1);
         sim.step();
         assert_eq!(sim.entity_count(), 0, "an ant in water should drown");
+    }
+
+    #[test]
+    fn fliers_and_swimmers_perish_in_lava_and_fire() {
+        // Lava and fire kill every creature, not just ants underfoot: a bird that
+        // wheels into the flames or a fish flung into lava dies just the same.
+        let floor = GRID_H - 1;
+
+        // A bird caught in a block of fire (filled so the flames don't just rise
+        // out from under it before it's stepped) burns up.
+        let mut sim = Simulation::new();
+        for y in (floor - 4)..=floor {
+            for x in 98..=102 {
+                sim.set(x, y, FIRE);
+            }
+        }
+        sim.spawn_entity(BIRD, 100, floor as i32 - 2);
+        assert_eq!(sim.entity_count(), 1);
+        sim.step();
+        assert_eq!(sim.entity_count(), 0, "a bird in fire should burn up");
+
+        // A fish dropped into a lava pool is reaped just like an ant would be.
+        let mut sim = Simulation::new();
+        for x in 90..110 {
+            sim.set(x, floor, LAVA);
+        }
+        sim.spawn_entity(FISH, 100, floor as i32);
+        assert_eq!(sim.entity_count(), 1);
+        sim.step();
+        assert_eq!(sim.entity_count(), 0, "a fish in lava should die");
     }
 
     #[test]
@@ -993,9 +1025,15 @@ mod tests {
     #[test]
     fn oil_floats_on_water() {
         // Oil is lighter than water, so a grain of oil dropped into a water
-        // column should end up sitting above the water, not below it.
+        // column should end up sitting above the water, not below it. Stone walls
+        // box the two into a one-cell-wide well so they can only rearrange
+        // vertically rather than spreading out across the open floor.
         let mut sim = Simulation::new();
         let floor = GRID_H - 1;
+        sim.set(9, floor, STONE);
+        sim.set(9, floor - 1, STONE);
+        sim.set(11, floor, STONE);
+        sim.set(11, floor - 1, STONE);
         sim.set(10, floor, OIL);
         sim.set(10, floor - 1, WATER);
         for _ in 0..50 {

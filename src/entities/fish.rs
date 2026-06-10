@@ -6,7 +6,8 @@
 //! opportunist — if an ant strays close along the bank it lines up beneath it and
 //! *leaps* clear of the water to snatch it, splashing back down after. Out of
 //! water too long it suffocates, and (like everything) it starves if it can find
-//! nothing to eat. See [`behaviors::swim`].
+//! nothing to eat — and, like any creature, dies at once in lava or fire. See
+//! [`behaviors::swim`].
 
 use super::behaviors;
 use super::{Entity, EntityInfo, EntityState, ANT};

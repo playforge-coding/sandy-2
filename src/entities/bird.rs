@@ -5,7 +5,8 @@
 //! drifts over the landscape rather than ever settling on it. As it grows hungry
 //! it turns predator, diving on prey it spots below — a fish at the water's
 //! surface for choice, an ant on the ground otherwise — and snatching it up, and
-//! starves if the hunting is barren. See [`behaviors::hunt`].
+//! starves if the hunting is barren — or dies outright if it wheels into lava or
+//! fire. See [`behaviors::hunt`].
 
 use super::behaviors;
 use super::{Entity, EntityInfo, EntityState, ANT, FISH};

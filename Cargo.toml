@@ -32,6 +32,11 @@ egui-winit = { version = "0.34", default-features = false }
 # The Rust port of FastNoise Lite — drives seed-based world generation
 # (terrain heightmap + tree placement). Pure Rust, so it builds on web too.
 fastnoise-lite = "1.1.1"
+# A drop-in `std::time::Instant` that also works on wasm (backed by the browser's
+# `performance.now()`); `std`'s `Instant::now()` panics on wasm32. Drives the
+# fixed-timestep sim clock so the game runs at the same speed on every platform
+# regardless of the display's refresh rate.
+web-time = "1.1"
 
 # ---- Desktop only ----
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
