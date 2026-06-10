@@ -425,10 +425,11 @@ impl App {
         }
     }
 
-    /// Rebuild the world from the current seed.
+    /// Rebuild the world from the current seed and selected preset.
     fn regenerate(&mut self) {
         if let Some(state) = &mut self.state {
-            crate::worldgen::generate(&mut state.sim, self.input.controls.seed_value() as i32);
+            let c = &self.input.controls;
+            crate::worldgen::generate_world(&mut state.sim, c.seed_value() as i32, c.world);
         }
     }
 
@@ -438,7 +439,7 @@ impl App {
             // Keep it within the seed box's digit cap so the value always fits.
             let seed = state.sim.rand_u32() % 10_000_000;
             self.input.controls.set_seed(seed);
-            crate::worldgen::generate(&mut state.sim, seed as i32);
+            crate::worldgen::generate_world(&mut state.sim, seed as i32, self.input.controls.world);
         }
     }
 }

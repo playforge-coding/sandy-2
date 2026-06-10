@@ -52,6 +52,13 @@ fn solid(sim: &Simulation, x: i32, y: i32) -> bool {
     }
 }
 
+/// Open water — what a flier should skim over rather than plunge into. A bird is
+/// an air creature, so the sea is a soft floor to it: it dips to the surface to
+/// snatch a fish but shouldn't disappear beneath it.
+fn is_water(sim: &Simulation, x: i32, y: i32) -> bool {
+    matches!(sim.cell_mat(x, y), Some(WATER))
+}
+
 /// Whether a cell blocks a flier's path. Like [`solid`], but soft, wispy cells —
 /// a tree's leafy canopy and clouds — don't count, so a bird or breaching fish
 /// wings straight through them rather than bouncing off. (Walkers still treat
@@ -147,10 +154,10 @@ pub fn fly(sim: &mut Simulation, me: &mut EntityState) {
     }
     me.vy *= VY_DAMPING;
 
-    // Steer clear of the ground below and the ceiling above (winging through
-    // leaves, not over them).
-    if (1..=GROUND_CLEARANCE).any(|d| obstacle(sim, x, y + d)) {
-        me.vy -= 0.5; // climb away from the terrain
+    // Steer clear of the ground or sea below and the ceiling above (winging
+    // through leaves, not over them; skimming the water, not into it).
+    if (1..=GROUND_CLEARANCE).any(|d| obstacle(sim, x, y + d) || is_water(sim, x, y + d)) {
+        me.vy -= 0.5; // climb away from the terrain (or waterline)
     }
     if me.y < SKY_MARGIN {
         me.vy += 0.4; // dip away from the top of the world
@@ -377,6 +384,12 @@ fn dive(sim: &mut Simulation, me: &mut EntityState, dx: f32, dy: f32) {
     // Aim vertically at the prey, but pull up if terrain is close below.
     me.vy = dy.clamp(-DIVE_SPEED, DIVE_SPEED);
     if (1..=2).any(|d| obstacle(sim, x, y + d)) {
+        me.vy = -DIVE_SPEED;
+    }
+    // Skim the sea rather than diving under it: the moment more than the surface
+    // cell is submerged, pull up. The bird can still snatch a fish within
+    // `EAT_REACH` of the surface without vanishing beneath the waves.
+    if is_water(sim, x, y) && is_water(sim, x, y - 1) {
         me.vy = -DIVE_SPEED;
     }
 

@@ -12,6 +12,7 @@ use egui::{Color32, RichText, Stroke};
 
 use crate::entities::{self, EntityKindId};
 use crate::materials::{self, MaterialId};
+use crate::worldgen::WorldType;
 
 /// Longest seed the user can type — keeps the value comfortably within `u32`.
 const MAX_SEED_DIGITS: usize = 7;
@@ -52,6 +53,8 @@ pub struct Controls {
     /// The world seed, as text so it can be edited in a box. Parsed to a `u32`
     /// when a world is actually built (see [`Controls::seed_value`]).
     pub seed: String,
+    /// Which landscape preset the next generation builds.
+    pub world: WorldType,
 }
 
 impl Default for Controls {
@@ -62,6 +65,7 @@ impl Default for Controls {
             entity: crate::entities::ANT,
             brush: 4,
             seed: crate::worldgen::DEFAULT_SEED.to_string(),
+            world: WorldType::default(),
         }
     }
 }
@@ -183,6 +187,23 @@ pub fn draw(ctx: &egui::Context, c: &mut Controls) -> Actions {
             ui.add(egui::Slider::new(&mut c.brush, 0..=40).text(brush_label));
 
             ui.separator();
+            // World preset. Switching it regenerates the world right away so the
+            // change is visible without a second click.
+            ui.horizontal(|ui| {
+                ui.label("World");
+                let before = c.world;
+                egui::ComboBox::from_id_salt("world_type")
+                    .selected_text(c.world.name())
+                    .show_ui(ui, |ui| {
+                        for w in WorldType::ALL {
+                            ui.selectable_value(&mut c.world, w, w.name());
+                        }
+                    });
+                if c.world != before {
+                    actions.generate = true;
+                }
+            });
+
             ui.horizontal(|ui| {
                 ui.label("Seed");
                 let edit = egui::TextEdit::singleline(&mut c.seed)

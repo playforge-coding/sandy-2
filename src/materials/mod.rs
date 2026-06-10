@@ -54,6 +54,7 @@ pub type MaterialId = u8;
 pub const EMPTY: MaterialId = 0;
 /// Named ids for materials that other materials react with. These must match
 /// the positions in [`REGISTRY`].
+pub const SAND: MaterialId = 1;
 pub const STONE: MaterialId = 2;
 pub const WATER: MaterialId = 3;
 pub const LAVA: MaterialId = 4;
