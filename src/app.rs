@@ -55,7 +55,7 @@ impl Default for Input {
 /// Sub-units of wind added per grid cell the cursor sweeps (see
 /// [`crate::sim::Simulation::add_wind_disk`]). A brisk flick saturates the gust
 /// field for a strong, short-lived blast; a slow drag nudges gently.
-const WIND_DRAG_GAIN: i32 = 6;
+const WIND_DRAG_GAIN: i32 = 9;
 
 struct App {
     // Only consumed on the web (the async-init handoff); unused on native.
@@ -208,6 +208,8 @@ impl ApplicationHandler<UserEvent> for App {
                     // `drawing` off.
                     match self.input.controls.tool {
                         ui::Tool::Meteor => self.summon_meteor(),
+                        ui::Tool::Tsunami => self.summon_tsunami(),
+                        ui::Tool::GammaBurst => self.summon_gamma_burst(),
                         ui::Tool::Creature => self.place_creature(),
                         _ => {
                             self.input.drawing = true;
@@ -228,8 +230,10 @@ impl ApplicationHandler<UserEvent> for App {
                 self.input.cursor = (touch.location.x, touch.location.y);
                 match touch.phase {
                     TouchPhase::Started => match (consumed, self.input.controls.tool) {
-                        // One meteor / creature per tap, like a mouse click.
+                        // One meteor / tsunami / burst / creature per tap.
                         (false, ui::Tool::Meteor) => self.summon_meteor(),
+                        (false, ui::Tool::Tsunami) => self.summon_tsunami(),
+                        (false, ui::Tool::GammaBurst) => self.summon_gamma_burst(),
                         (false, ui::Tool::Creature) => self.place_creature(),
                         _ => {
                             self.input.drawing = !consumed;
@@ -295,10 +299,14 @@ impl App {
                     }
                     self.input.last_wind = Some((gx, gy));
                 }
-                // Meteors and creatures act on click (see `summon_meteor` /
+                // Meteors, tsunamis, bursts and creatures act on click (see
+                // `summon_meteor` / `summon_tsunami` / `summon_gamma_burst` /
                 // `place_creature`), not on a held drag, so a held stroke does
                 // nothing here.
-                ui::Tool::Meteor | ui::Tool::Creature => {}
+                ui::Tool::Meteor
+                | ui::Tool::Tsunami
+                | ui::Tool::GammaBurst
+                | ui::Tool::Creature => {}
             }
         }
 
@@ -336,6 +344,24 @@ impl App {
         if let Some(state) = &mut self.state {
             let (gx, gy) = state.cursor_to_grid(self.input.cursor);
             state.sim.spawn_meteor(gx, gy);
+        }
+    }
+
+    /// Send a tsunami rolling toward the cell under the cursor (the Tsunami
+    /// tool's click).
+    fn summon_tsunami(&mut self) {
+        if let Some(state) = &mut self.state {
+            let (gx, gy) = state.cursor_to_grid(self.input.cursor);
+            state.sim.spawn_tsunami(gx, gy);
+        }
+    }
+
+    /// Call down a gamma-ray burst on the column under the cursor (the Gamma Ray
+    /// tool's click).
+    fn summon_gamma_burst(&mut self) {
+        if let Some(state) = &mut self.state {
+            let (gx, gy) = state.cursor_to_grid(self.input.cursor);
+            state.sim.spawn_gamma_burst(gx, gy);
         }
     }
 
@@ -400,6 +426,11 @@ impl App {
             KeyCode::KeyW => c.tool = ui::Tool::Wind,
             // Meteor tool: click to call a meteor down on that spot.
             KeyCode::KeyM => c.tool = ui::Tool::Meteor,
+            // Tsunami tool: click to send a wave rolling toward that spot.
+            KeyCode::KeyT => c.tool = ui::Tool::Tsunami,
+            // Gamma-ray-burst tool: click to annihilate that column from the sky.
+            // (G is taken by world-generate, so the burst lives on Y.)
+            KeyCode::KeyY => c.tool = ui::Tool::GammaBurst,
             // Creature tools: click to drop the chosen creature on that spot.
             KeyCode::KeyA => {
                 c.entity = crate::entities::ANT;
@@ -465,7 +496,7 @@ pub fn run() {
     }
 
     log::info!(
-        "Controls: use the panel, or press 1=Sand 2=Stone 3=Water 4=Lava 5=Oil 6=Fire 7=Soil 8=Wood 9=Leaves  0/Backspace=Erase  W=wind tool (sweep to blow a gust)  M=meteor tool (click to summon)  A=ant B=bird (click to drop one)  [ ]=brush size  C=clear  G=generate world  R=random seed  (hold left mouse to draw)  — drag a .rhai file onto the window to add a material"
+        "Controls: use the panel, or press 1=Sand 2=Stone 3=Water 4=Lava 5=Oil 6=Fire 7=Soil 8=Wood 9=Leaves  0/Backspace=Erase  W=wind tool (sweep to blow a gust)  M=meteor tool (click to summon)  T=tsunami (click to send a wave)  Y=gamma ray (click to annihilate a column)  A=ant B=bird (click to drop one)  [ ]=brush size  C=clear  G=generate world  R=random seed  (hold left mouse to draw)  — drag a .rhai file onto the window to add a material"
     );
 
     let event_loop = EventLoop::<UserEvent>::with_user_event()

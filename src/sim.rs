@@ -70,15 +70,85 @@ pub(crate) const VEL_UNIT: i32 = 32;
 
 /// Peak strength of the prevailing ambient breeze, in velocity sub-units. Kept
 /// gentle — a fraction of a cell per tick — so the default weather nudges
-/// clouds across the sky and leans flames without flinging anything about. The
-/// wind *tool* layers much stronger, local gusts on top of this.
-const AMBIENT_MAX: i32 = 6;
+/// clouds across the sky, leans flames, and slants a pouring sand stream without
+/// flinging anything about (and stays below [`crate::behaviors`]' liquid-flow
+/// threshold, so it never stops a pond levelling). The wind *tool* layers much
+/// stronger, local gusts on top of this.
+const AMBIENT_MAX: i32 = 12;
 
 /// Angular rate of the ambient breeze's oscillation, in radians per tick. The
 /// breeze eases through a full reverse-and-back cycle every `2π / this` ticks
 /// (~40 s at 60 fps) — a smooth sine rather than the old hard flip, so the wind
 /// swells and slackens like real weather.
 const AMBIENT_RATE: f32 = 0.0026;
+
+/// Cells per tick the tsunami's crest advances when it first breaks. Deliberately
+/// brisk so the wave is moving from the off.
+const TSUNAMI_START_SPEED: f32 = 1.5;
+/// Hard cap on the crest's speed, in cells per tick — a churning few-cells-a-tick
+/// surge at full tilt.
+const TSUNAMI_MAX_SPEED: f32 = 6.0;
+/// How much the crest speeds up each tick (cells per tick²): the wave *quickens*
+/// as it rolls, just as a real one steepens running into the shallows.
+const TSUNAMI_ACCEL: f32 = 0.06;
+/// The crest's starting height above the floor, in cells. Already a towering
+/// wall when it breaks — it only builds from there.
+const TSUNAMI_START_HEIGHT: f32 = 70.0;
+/// How many cells taller the crest grows each tick — the wave *builds* as it
+/// travels. Capped at [`TSUNAMI_MAX_HEIGHT`].
+const TSUNAMI_GROWTH: f32 = 1.0;
+/// Ceiling on the crest height, as a fraction of the world height, so even a
+/// long run leaves some sky.
+const TSUNAMI_MAX_HEIGHT: f32 = GRID_H as f32 * 0.6;
+/// Strength of the gust the crest drives ahead of itself, in velocity sub-units.
+/// Well past the liquid-flow threshold (see [`crate::behaviors`]) so the standing
+/// water it floods over surges along with the wave rather than just levelling.
+const TSUNAMI_GUST: i32 = 120;
+
+/// Cells per tick the gamma-ray burst's searing front plunges from the sky —
+/// near-instant, lancing through the whole world in a handful of ticks.
+const BURST_SPEED: i32 = 18;
+/// Half-width of the burst's beam, in cells: it vaporises this far to either side
+/// of the strike column.
+const BURST_RADIUS: i32 = 7;
+/// Depth of the glowing fire wavefront left at the beam's leading edge, in cells.
+/// The flames linger in the carved channel and burn out on their own.
+const BURST_FIRE_TIP: i32 = 5;
+
+/// A natural disaster in progress: a wall of water that rolls across the world
+/// from one side, the crest climbing higher and the surge quickening as it goes,
+/// until it runs off the far edge and subsides into the flood it left behind.
+/// Summoned by [`Simulation::spawn_tsunami`] and advanced once per tick by
+/// [`Simulation::advance_tsunami`].
+#[derive(Clone, Copy)]
+struct Tsunami {
+    /// Sweep direction: `+1` rolling right, `-1` rolling left.
+    dir: i32,
+    /// The crest's current column, kept as an `f32` so a sub-cell speed advances
+    /// it smoothly between ticks.
+    front: f32,
+    /// Cells per tick the crest currently advances — the surge speed. Grows each
+    /// tick toward [`TSUNAMI_MAX_SPEED`].
+    speed: f32,
+    /// The crest's current height above the floor, in cells — the wave size.
+    /// Grows each tick toward [`TSUNAMI_MAX_HEIGHT`].
+    height: f32,
+}
+
+/// A natural disaster in progress: a gamma-ray burst — a pillar of annihilating
+/// energy that lances straight down from the sky and vaporises *everything* in a
+/// narrow swath, leaving a clean channel of vacuum, flames flickering in its
+/// wake, and a molten scar where it strikes the ground. Unlike the tsunami it
+/// spares nothing — stone and bedrock included. Summoned by
+/// [`Simulation::spawn_gamma_burst`] and advanced once per tick by
+/// [`Simulation::advance_gamma_burst`].
+#[derive(Clone, Copy)]
+struct GammaBurst {
+    /// The column the beam lances down.
+    x: i32,
+    /// How far down the searing front has reached so far, in rows from the top.
+    front: i32,
+}
 
 pub struct Simulation {
     pub width: usize,
@@ -103,6 +173,13 @@ pub struct Simulation {
     /// sweep (and the cost of touching the whole field) be skipped entirely on a
     /// calm world, which is the common case.
     gust_active: bool,
+    /// The tsunami currently rolling across the world, if any (see [`Tsunami`]).
+    /// `None` the rest of the time, so the disaster costs nothing when it isn't
+    /// happening.
+    tsunami: Option<Tsunami>,
+    /// The gamma-ray burst currently lancing down, if any (see [`GammaBurst`]).
+    /// `None` the rest of the time.
+    gamma_burst: Option<GammaBurst>,
     /// Per-id [`MaterialInfo`] cache, indexed by [`MaterialId`]. Looking a
     /// material up in the registry costs a `thread_local` + `RefCell` borrow and
     /// a dynamic call; doing that per cell in the hot `try_move`/`render_into`
@@ -129,6 +206,8 @@ impl Simulation {
             wind_x: vec![0; GRID_W * GRID_H],
             wind_y: vec![0; GRID_W * GRID_H],
             gust_active: false,
+            tsunami: None,
+            gamma_burst: None,
             infos: Self::snapshot_infos(),
             entities: Vec::new(),
         }
@@ -390,6 +469,162 @@ impl Simulation {
         self.set_velocity(sx, 0, vx, vy);
     }
 
+    /// Summon a tsunami headed toward `(target_x, _)`: a wall of water breaks in
+    /// from the far side of the world and rolls *toward* the clicked spot (and on
+    /// across, off the near edge), the crest building higher and the surge
+    /// quickening as it travels (see [`Tsunami`]). Replaces any tsunami already in
+    /// progress. An off-grid target is ignored.
+    pub fn spawn_tsunami(&mut self, target_x: i32, _target_y: i32) {
+        if target_x < 0 || target_x as usize >= self.width {
+            return;
+        }
+        // Break from the edge *opposite* the click and roll toward it, so the
+        // wave bears down on the spot the user picked rather than away from it.
+        let (front, dir) = if (target_x as usize) < self.width / 2 {
+            ((self.width - 1) as f32, -1)
+        } else {
+            (0.0, 1)
+        };
+        self.tsunami = Some(Tsunami {
+            dir,
+            front,
+            speed: TSUNAMI_START_SPEED,
+            height: TSUNAMI_START_HEIGHT,
+        });
+    }
+
+    /// Advance the active tsunami one tick: quicken and build the crest, roll it
+    /// forward, stamp the moving wall of water, and drive a gust ahead of it so
+    /// the flood it has already laid down surges along rather than just levelling.
+    /// Clears the tsunami once the crest rolls off the far edge. A no-op when no
+    /// tsunami is in progress.
+    fn advance_tsunami(&mut self) {
+        let Some(mut t) = self.tsunami else {
+            return;
+        };
+
+        // Build and quicken: the wave grows taller and faster as it rolls, up to
+        // its caps.
+        t.height = (t.height + TSUNAMI_GROWTH).min(TSUNAMI_MAX_HEIGHT);
+        t.speed = (t.speed + TSUNAMI_ACCEL).min(TSUNAMI_MAX_SPEED);
+        t.front += t.speed * t.dir as f32;
+
+        let fx = t.front.round() as i32;
+        // Rolled off the far edge: the wave is spent, leaving its flood behind.
+        if fx < 0 || fx >= self.width as i32 {
+            self.tsunami = None;
+            return;
+        }
+
+        // Stamp the crest as a band of columns (as wide as a tick's travel, so a
+        // fast wave leaves no gaps) filled with water from the floor up to the
+        // crest height. The wave fills open air and tears out anything light
+        // enough to be swept away — the wood and leaves of trees, which it rips up
+        // and carries off as water. Solid ground (stone, soil) stands fast, so the
+        // flood rolls *over* the land rather than carving through it; and a column
+        // already full to the crest stops taking water, which keeps the flood from
+        // running away.
+        let crest = t.height as i32;
+        let thickness = t.speed.ceil() as i32;
+        for back in 0..thickness {
+            let cx = fx - t.dir * back;
+            if cx < 0 || cx >= self.width as i32 {
+                continue;
+            }
+            let cx = cx as usize;
+            for dy in 0..crest {
+                let y = self.height as i32 - 1 - dy;
+                if y < 0 {
+                    break;
+                }
+                let y = y as usize;
+                let m = self.mat_at(cx, y);
+                if m == materials::EMPTY || m == materials::WOOD || m == materials::LEAVES {
+                    self.set(cx, y, materials::WATER);
+                }
+            }
+        }
+
+        // Drive a strong gust through the body of the wave so the water it has
+        // already flooded surges forward with the crest instead of settling flat.
+        let cy = self.height as i32 - 1 - crest / 2;
+        self.add_wind_disk(fx, cy, crest, TSUNAMI_GUST * t.dir, 0);
+
+        self.tsunami = Some(t);
+    }
+
+    /// Call down a gamma-ray burst on the column under `(target_x, _)`: a pillar
+    /// of energy that lances down from the sky and annihilates everything in a
+    /// narrow swath (see [`GammaBurst`]). Replaces any burst already in progress.
+    /// An off-grid target is ignored.
+    pub fn spawn_gamma_burst(&mut self, target_x: i32, _target_y: i32) {
+        if target_x < 0 || target_x as usize >= self.width {
+            return;
+        }
+        self.gamma_burst = Some(GammaBurst {
+            x: target_x,
+            front: 0,
+        });
+    }
+
+    /// Advance the active gamma-ray burst one tick: drive its searing front a long
+    /// way down the strike column, vaporising the whole swath it passes to vacuum
+    /// and leaving a band of fire glowing at the leading edge. When the front
+    /// reaches the ground it leaves a molten scar and the burst is spent. A no-op
+    /// when no burst is in progress.
+    fn advance_gamma_burst(&mut self) {
+        let Some(mut b) = self.gamma_burst else {
+            return;
+        };
+
+        let top = b.front;
+        let bottom = (b.front + BURST_SPEED).min(self.height as i32);
+
+        // Annihilate the band the front sweeps through this tick, clean across the
+        // beam's width. A burst spares *nothing* — stone and bedrock included — so
+        // this clears to vacuum unconditionally.
+        for y in top..bottom {
+            for dx in -BURST_RADIUS..=BURST_RADIUS {
+                let x = b.x + dx;
+                if x >= 0 && (x as usize) < self.width && (y as usize) < self.height {
+                    self.set(x as usize, y as usize, materials::EMPTY);
+                }
+            }
+        }
+
+        // Glowing wavefront: a band of fire right at the leading edge, narrowing
+        // to a fierce core. Left behind as the front races on, it flickers in the
+        // carved channel and burns out on its own.
+        for y in (bottom - BURST_FIRE_TIP).max(top)..bottom {
+            for dx in -BURST_RADIUS..=BURST_RADIUS {
+                let x = b.x + dx;
+                if x >= 0 && (x as usize) < self.width && (y as usize) < self.height {
+                    self.set(x as usize, y as usize, materials::FIRE);
+                }
+            }
+        }
+
+        b.front = bottom;
+        if b.front >= self.height as i32 {
+            // Struck the ground: leave a molten scar of lava in the crater floor.
+            for dy in 0..3 {
+                let y = self.height as i32 - 1 - dy;
+                if y < 0 {
+                    break;
+                }
+                for dx in -BURST_RADIUS..=BURST_RADIUS {
+                    let x = b.x + dx;
+                    if x >= 0 && (x as usize) < self.width {
+                        self.set(x as usize, y as usize, materials::LAVA);
+                    }
+                }
+            }
+            self.gamma_burst = None;
+            return;
+        }
+        self.gamma_burst = Some(b);
+    }
+
     pub fn clear(&mut self) {
         for c in self.cells.iter_mut() {
             *c = VOID;
@@ -398,6 +633,9 @@ impl Simulation {
         self.wind_x.iter_mut().for_each(|v| *v = 0);
         self.wind_y.iter_mut().for_each(|v| *v = 0);
         self.gust_active = false;
+        // Call off any disaster in progress.
+        self.tsunami = None;
+        self.gamma_burst = None;
         // And clear out the wildlife: a cleared world is empty of creatures too.
         self.entities.clear();
     }
@@ -430,6 +668,11 @@ impl Simulation {
         self.frame = self.frame.wrapping_add(1);
         // Advance the weather: ambient breeze plus decaying tool-painted gusts.
         self.update_wind();
+        // Roll any tsunami forward. After `update_wind` so the gust it drives
+        // isn't decayed away before this tick's liquids get to ride it.
+        self.advance_tsunami();
+        // Lance any gamma-ray burst down through the world.
+        self.advance_gamma_burst();
         // Refresh the per-id info cache for this tick's hot paths (`try_move`,
         // and `render_into` which runs right after). Cheap: one entry per
         // material, and it picks up any plugin registered since last tick.
@@ -995,8 +1238,15 @@ mod tests {
             sim.step();
         }
 
+        // It vacates the top and comes to rest on the floor. The exact column is
+        // no longer fixed: the ambient breeze leans a falling grain as it drops
+        // (see `wind_slants_a_falling_sand_stream`), so we just look for it
+        // anywhere along the bottom row.
         assert_eq!(sim.mat_at(10, 0), EMPTY);
-        assert_eq!(sim.mat_at(10, GRID_H - 1), SAND);
+        assert!(
+            (0..GRID_W).any(|x| sim.mat_at(x, GRID_H - 1) == SAND),
+            "the grain should have settled somewhere on the floor"
+        );
     }
 
     #[test]
@@ -1184,9 +1434,10 @@ mod tests {
 
     #[test]
     fn calm_air_never_nudges_settled_sand_sideways() {
-        // Sand isn't wind-borne, so even with the ambient breeze blowing for a
-        // long time a grain resting on the floor must not creep sideways. Guards
-        // against accidentally wiring the velocity system into heavy materials.
+        // Only *airborne* grains ride the wind: a grain that has settled (here,
+        // resting on the floor) must stay put, even with the ambient breeze
+        // blowing for a long time. Guards against the wind dismantling built
+        // piles and dunes rather than just slanting what's falling.
         let mut sim = Simulation::new();
         let x = 10;
         sim.set(x, GRID_H - 1, SAND);
@@ -1194,6 +1445,167 @@ mod tests {
             sim.step();
         }
         assert_eq!(sim.mat_at(x, GRID_H - 1), SAND);
+    }
+
+    #[test]
+    fn wind_slants_a_falling_sand_stream() {
+        // A grain dropped from up high, under a steady rightward gust the whole
+        // way down, should land well to the right of the column it fell from —
+        // the wind carries loose, airborne powder.
+        let mut sim = Simulation::new();
+        let start_x = 30;
+        sim.set(start_x, 2, SAND);
+        for _ in 0..(GRID_H * 2) {
+            // Re-paint a tall, wide rightward gust each tick so the falling grain
+            // stays in moving air the whole way down.
+            sim.add_wind_disk(start_x as i32 + 20, GRID_H as i32 / 2, GRID_H as i32, 90, 0);
+            sim.step();
+        }
+        let landed_x = (0..GRID_W)
+            .find(|&gx| (0..GRID_H).any(|gy| sim.mat_at(gx, gy) == SAND))
+            .expect("the grain should have come to rest somewhere");
+        assert!(
+            landed_x > start_x + 2,
+            "wind should carry the falling grain right, landed at x={landed_x}"
+        );
+    }
+
+    #[test]
+    fn a_stiff_gust_sloshes_water_downwind() {
+        // A flat puddle on the floor, blown hard to the right, should heap up to
+        // the right of where it was poured rather than staying centred — the gust
+        // shoves the liquid surface bodily downwind.
+        let mut sim = Simulation::new();
+        let floor = GRID_H - 1;
+        let left = 20;
+        for x in left..left + 10 {
+            sim.set(x, floor, WATER);
+        }
+        let center_of_mass = |sim: &Simulation| -> f32 {
+            let mut sum = 0.0;
+            let mut n = 0.0;
+            for x in 0..GRID_W {
+                for y in 0..GRID_H {
+                    if sim.mat_at(x, y) == WATER {
+                        sum += x as f32;
+                        n += 1.0;
+                    }
+                }
+            }
+            sum / n
+        };
+        let before = center_of_mass(&sim);
+        for _ in 0..120 {
+            sim.add_wind_disk(GRID_W as i32 / 2, floor as i32, GRID_W as i32, 120, 0);
+            sim.step();
+        }
+        let after = center_of_mass(&sim);
+        assert!(
+            after > before + 2.0,
+            "the gust should push the water right, moved {before} -> {after}"
+        );
+    }
+
+    #[test]
+    fn a_tsunami_floods_across_the_world() {
+        // Aimed at the right half, the wave breaks from the *left* edge and rolls
+        // toward the click. After it has had time to cross, there should be a
+        // great deal of water — including over on the far right, where the empty
+        // world started with none — and the disaster should have run its course.
+        let mut sim = Simulation::new();
+        sim.spawn_tsunami(GRID_W as i32 - 80, GRID_H as i32 / 2);
+        assert!(sim.tsunami.is_some(), "summoning should start a tsunami");
+
+        for _ in 0..300 {
+            sim.step();
+        }
+
+        let water = (0..GRID_W)
+            .flat_map(|x| (0..GRID_H).map(move |y| (x, y)))
+            .filter(|&(x, y)| sim.mat_at(x, y) == WATER)
+            .count();
+        assert!(
+            water > 2000,
+            "the wave should leave a sizeable flood, got {water}"
+        );
+
+        let reached_far_side =
+            (GRID_W - 40..GRID_W).any(|x| (0..GRID_H).any(|y| sim.mat_at(x, y) == WATER));
+        assert!(
+            reached_far_side,
+            "the wave should have rolled to the far side"
+        );
+
+        assert!(
+            sim.tsunami.is_none(),
+            "the tsunami should be spent once it rolls off the edge"
+        );
+    }
+
+    #[test]
+    fn a_tsunami_tears_down_trees_in_its_path() {
+        // A tree standing in the wave's path should be swept away: a tall wave
+        // breaking from the left rolls over it and leaves no wood or leaves behind.
+        const WOOD: MaterialId = 8;
+        const LEAVES: MaterialId = 9;
+        let mut sim = Simulation::new();
+        let tree_x = GRID_W / 2;
+        let floor = GRID_H - 1;
+        // A short trunk capped with a leafy blob, low enough to sit under the crest.
+        for dy in 0..12 {
+            sim.set(tree_x, floor - dy, WOOD);
+        }
+        for dx in -3i32..=3 {
+            for dy in 10..16 {
+                let lx = tree_x as i32 + dx;
+                let ly = floor as i32 - dy;
+                if lx >= 0 && ly >= 0 {
+                    sim.set(lx as usize, ly as usize, LEAVES);
+                }
+            }
+        }
+
+        sim.spawn_tsunami(GRID_W as i32 - 1, GRID_H as i32 / 2);
+        for _ in 0..300 {
+            sim.step();
+        }
+
+        let tree_remains = (0..GRID_W)
+            .any(|x| (0..GRID_H).any(|y| sim.mat_at(x, y) == WOOD || sim.mat_at(x, y) == LEAVES));
+        assert!(!tree_remains, "the wave should have destroyed the tree");
+    }
+
+    #[test]
+    fn a_gamma_ray_burst_annihilates_a_column() {
+        // Fill a tall column of solid stone, then call a burst down on it. The
+        // beam should bore a clean vacuum channel straight through — stone and
+        // all — leaving a molten scar at the floor, and the burst should be spent.
+        let mut sim = Simulation::new();
+        let x = GRID_W / 2;
+        for y in 0..GRID_H {
+            sim.set(x, y, STONE);
+        }
+        sim.spawn_gamma_burst(x as i32, 0);
+        assert!(sim.gamma_burst.is_some(), "summoning should start a burst");
+
+        // Long enough for the front to reach the floor and the front-edge flames
+        // to burn out, but the bored channel is permanent.
+        for _ in 0..200 {
+            sim.step();
+        }
+
+        // It punched all the way down: no stone survives anywhere in the strike
+        // column (stone is immovable and nothing here turns back into it, so this
+        // is a durable check).
+        let stone_left = (0..GRID_H).any(|y| sim.mat_at(x, y) == STONE);
+        assert!(!stone_left, "nothing in the strike column should survive");
+        // And it left a molten scar of lava in the crater floor.
+        let molten_scar = (GRID_H - 3..GRID_H).any(|y| sim.mat_at(x, y) == LAVA);
+        assert!(molten_scar, "the strike should leave a molten scar");
+        assert!(
+            sim.gamma_burst.is_none(),
+            "the burst should be spent once it reaches the ground"
+        );
     }
 
     #[test]

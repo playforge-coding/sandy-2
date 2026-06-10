@@ -19,6 +19,13 @@ use crate::sim::{Simulation, VEL_UNIT};
 /// zero, so no separate friction term is needed).
 const WIND_RESPONSE: i32 = 3;
 
+/// A liquid surface only flows *with* the wind once the wind here is stronger
+/// than this (in velocity sub-units). Pitched above the ambient breeze's peak so
+/// the gentle prevailing wind never stops a pond levelling off — only a stiff
+/// painted gust sloshes the water bodily downwind, piling it against the leeward
+/// shore until the gust fades.
+const WIND_FLOW_THRESHOLD: i32 = 16;
+
 /// Catch fire from an adjacent flame or lava, turning this cell into [`FIRE`].
 ///
 /// A combustible solid (wood, leaves) calls this before its normal "do nothing"
@@ -258,8 +265,29 @@ pub fn solid(_sim: &mut Simulation, _x: usize, _y: usize) {}
 /// Powder: fall straight down; if blocked, tumble diagonally so the material
 /// settles into a pile at its angle of repose. Used by sand, and any future
 /// dirt/ash/salt/gunpowder.
+///
+/// A loose grain falling through open air also rides the wind (see [`drift`]),
+/// so a gust slants a pouring stream and drifts a forming dune to leeward — but
+/// only while airborne. A grain with anything packed beneath it has settled, and
+/// the wind no longer stirs it; built piles and dunes stay put. Calm air makes
+/// `drift` a no-op, so this costs nothing when the weather is still.
 pub fn powder(sim: &mut Simulation, x: usize, y: usize) {
     // Resting on the floor.
+    if y + 1 >= sim.height {
+        return;
+    }
+    // Airborne (open air directly below): lean and travel on the wind first,
+    // then carry on falling from wherever the gust left the grain. `escape:
+    // false` keeps a grain blown against a side wall in the world.
+    let (x, y) = if sim.mat_at(x, y + 1) == EMPTY {
+        match drift(sim, x, y, false) {
+            Some(p) => p,
+            None => return,
+        }
+    } else {
+        (x, y)
+    };
+    // The wind may have carried the grain down onto the floor.
     if y + 1 >= sim.height {
         return;
     }
@@ -300,9 +328,17 @@ pub fn liquid(sim: &mut Simulation, x: usize, y: usize, speed: usize) {
             }
         }
     }
-    // Can't fall: flow sideways up to `speed` cells in one randomly-chosen
-    // direction, stopping at the first cell it can't enter.
-    let dir: i32 = if sim.rand_bool() { -1 } else { 1 };
+    // Can't fall: flow sideways up to `speed` cells, stopping at the first cell
+    // it can't enter. A stiff gust shoves the surface bodily downwind; otherwise
+    // it picks a side at random and seeks its own level.
+    let (wx, _) = sim.wind_at(x, y);
+    let dir: i32 = if wx.abs() > WIND_FLOW_THRESHOLD {
+        wx.signum()
+    } else if sim.rand_bool() {
+        -1
+    } else {
+        1
+    };
     let mut cx = x;
     for _ in 0..speed {
         let nx = cx as i32 + dir;

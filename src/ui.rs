@@ -29,6 +29,12 @@ pub enum Tool {
     /// Summon a meteor at the clicked spot (see
     /// [`crate::sim::Simulation::spawn_meteor`]).
     Meteor,
+    /// Summon a tsunami headed toward the clicked spot (see
+    /// [`crate::sim::Simulation::spawn_tsunami`]).
+    Tsunami,
+    /// Call down a gamma-ray burst on the clicked column (see
+    /// [`crate::sim::Simulation::spawn_gamma_burst`]).
+    GammaBurst,
     /// Place a creature of [`Controls::entity`] at the clicked spot (see
     /// [`crate::sim::Simulation::spawn_entity`]).
     Creature,
@@ -160,6 +166,24 @@ pub fn draw(ctx: &egui::Context, c: &mut Controls) -> Actions {
                 c.tool = Tool::Meteor;
             }
 
+            // The tsunami tool: click to send a wave rolling across the world.
+            let mut tsunami_btn = egui::Button::new("🌊 Tsunami").min_size(button_size);
+            if c.tool == Tool::Tsunami {
+                tsunami_btn = tsunami_btn.stroke(Stroke::new(2.0, Color32::WHITE));
+            }
+            if ui.add(tsunami_btn).clicked() {
+                c.tool = Tool::Tsunami;
+            }
+
+            // The gamma-ray-burst tool: click to annihilate a column from the sky.
+            let mut grb_btn = egui::Button::new("☢ Gamma Ray").min_size(button_size);
+            if c.tool == Tool::GammaBurst {
+                grb_btn = grb_btn.stroke(Stroke::new(2.0, Color32::WHITE));
+            }
+            if ui.add(grb_btn).clicked() {
+                c.tool = Tool::GammaBurst;
+            }
+
             ui.separator();
             // Creatures: pick one, then click in the world to drop it there.
             ui.label("Creatures");
@@ -228,6 +252,8 @@ pub fn draw(ctx: &egui::Context, c: &mut Controls) -> Actions {
                 RichText::new(
                     "Hold left-mouse to draw · pick Wind and sweep to blow a gust · \
                      pick Meteor and click to call one down · \
+                     pick Tsunami and click to send a wave · \
+                     pick Gamma Ray and click to annihilate a column · \
                      pick a creature and click to drop one · \
                      drag a .rhai file to add a material",
                 )
