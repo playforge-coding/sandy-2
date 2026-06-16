@@ -82,28 +82,48 @@ const AMBIENT_MAX: i32 = 12;
 /// swells and slackens like real weather.
 const AMBIENT_RATE: f32 = 0.0026;
 
-/// Cells per tick the tsunami's crest advances when it first breaks. Deliberately
+/// Cells per tick the tsunami's surge advances when it first breaks. Deliberately
 /// brisk so the wave is moving from the off.
 const TSUNAMI_START_SPEED: f32 = 1.5;
-/// Hard cap on the crest's speed, in cells per tick — a churning few-cells-a-tick
-/// surge at full tilt.
+/// Hard cap on the surge's speed, in cells per tick — a churning few-cells-a-tick
+/// rush at full tilt.
 const TSUNAMI_MAX_SPEED: f32 = 6.0;
-/// How much the crest speeds up each tick (cells per tick²): the wave *quickens*
+/// How much the surge speeds up each tick (cells per tick²): the wave *quickens*
 /// as it rolls, just as a real one steepens running into the shallows.
 const TSUNAMI_ACCEL: f32 = 0.06;
-/// The crest's starting height above the floor, in cells. Already a towering
-/// wall when it breaks — it only builds from there.
-const TSUNAMI_START_HEIGHT: f32 = 70.0;
-/// How many cells taller the crest grows each tick — the wave *builds* as it
-/// travels. Capped at [`TSUNAMI_MAX_HEIGHT`].
-const TSUNAMI_GROWTH: f32 = 1.0;
-/// Ceiling on the crest height, as a fraction of the world height, so even a
-/// long run leaves some sky.
-const TSUNAMI_MAX_HEIGHT: f32 = GRID_H as f32 * 0.6;
-/// Strength of the gust the crest drives ahead of itself, in velocity sub-units.
-/// Well past the liquid-flow threshold (see [`crate::behaviors`]) so the standing
-/// water it floods over surges along with the wave rather than just levelling.
+/// The surge's starting *depth*, in cells of water carried above the ground it runs
+/// over — the height of the travelling wall of water, measured from the local land
+/// surface (not the floor). The wave runs up and over anything shorter than this
+/// and rebounds off anything taller. It builds from here as it rolls.
+const TSUNAMI_START_HEIGHT: f32 = 26.0;
+/// How many cells deeper the surge grows each tick as it gathers — capped at
+/// [`TSUNAMI_MAX_HEIGHT`].
+const TSUNAMI_GROWTH: f32 = 0.12;
+/// Ceiling on the surge depth, in cells. Kept modest so the wave still rebounds off
+/// the taller hills and headlands rather than eventually drowning every one.
+const TSUNAMI_MAX_HEIGHT: f32 = 46.0;
+/// Strength of the gust the surge drives through itself, in velocity sub-units.
+/// Well past the liquid-flow threshold (see [`crate::behaviors`]) so the water it
+/// lays down rushes along with the wave rather than just levelling.
 const TSUNAMI_GUST: i32 = 120;
+/// Fraction of its depth the surge keeps on each rebound. Below 1 so a wave penned
+/// between hills sloshes back and forth with ever-shallower blows and eventually
+/// dies, rather than ricocheting forever.
+const TSUNAMI_BOUNCE_DAMP: f32 = 0.72;
+/// Once the surge has been beaten down below this depth (in cells) it's spent and
+/// subsides into the standing flood it has left behind.
+const TSUNAMI_MIN_HEIGHT: f32 = 9.0;
+/// Hard cap on a tsunami's life, in ticks — a backstop so a wave trapped in a wide
+/// basin (or sloshing an open world with only the edges to damp it) always subsides
+/// in the end rather than rolling on indefinitely.
+const TSUNAMI_LIFETIME: u32 = 280;
+/// Upward velocity (sub-units) of the gust flung off a struck hillside, on top of
+/// the reversed horizontal surge: the rebound throws a sheet of water skyward, so
+/// the bounce reads as a violent recoil rather than a tidy turnaround.
+const TSUNAMI_BOUNCE_LIFT: i32 = 120;
+/// Minimum radius of the gust disk the surge drives, in cells — so even a shallow
+/// surge still shoves its water along with real force.
+const TSUNAMI_GUST_RADIUS: i32 = 30;
 
 /// Cells per tick the gamma-ray burst's searing front plunges from the sky —
 /// near-instant, lancing through the whole world in a handful of ticks.
@@ -115,24 +135,34 @@ const BURST_RADIUS: i32 = 7;
 /// The flames linger in the carved channel and burn out on their own.
 const BURST_FIRE_TIP: i32 = 5;
 
-/// A natural disaster in progress: a wall of water that rolls across the world
-/// from one side, the crest climbing higher and the surge quickening as it goes,
-/// until it runs off the far edge and subsides into the flood it left behind.
-/// Summoned by [`Simulation::spawn_tsunami`] and advanced once per tick by
+/// A natural disaster in progress: a surge of water that rushes across the world
+/// from one side, running up and over the land, quickening and deepening as it
+/// goes — until it rears up against a hillside too tall to climb and rebounds, or
+/// runs off the far edge and subsides into the flood it left behind. Summoned by
+/// [`Simulation::spawn_tsunami`] and advanced once per tick by
 /// [`Simulation::advance_tsunami`].
 #[derive(Clone, Copy)]
 struct Tsunami {
     /// Sweep direction: `+1` rolling right, `-1` rolling left.
     dir: i32,
-    /// The crest's current column, kept as an `f32` so a sub-cell speed advances
-    /// it smoothly between ticks.
+    /// The surge front's current column, kept as an `f32` so a sub-cell speed
+    /// advances it smoothly between ticks.
     front: f32,
-    /// Cells per tick the crest currently advances — the surge speed. Grows each
+    /// Cells per tick the front currently advances — the surge speed. Grows each
     /// tick toward [`TSUNAMI_MAX_SPEED`].
     speed: f32,
-    /// The crest's current height above the floor, in cells — the wave size.
-    /// Grows each tick toward [`TSUNAMI_MAX_HEIGHT`].
+    /// The surge's current *depth*, in cells of water carried above the ground it
+    /// runs over. Grows each tick toward [`TSUNAMI_MAX_HEIGHT`].
     height: f32,
+    /// The ground height (above the floor) of the basin the surge is currently
+    /// running through — its footing. The water tops out `height` cells above this,
+    /// so the wave floods everything below that line and rebounds off any land that
+    /// rears up above it. Tracks the lowest ground the front has crossed since the
+    /// last rebound, so climbing a long slope accumulates toward a bounce rather
+    /// than the wave forever re-levelling itself up the hill.
+    base: i32,
+    /// Ticks elapsed since the wave broke — counts up against [`TSUNAMI_LIFETIME`].
+    age: u32,
 }
 
 /// A natural disaster in progress: a gamma-ray burst — a pillar of annihilating
@@ -485,70 +515,153 @@ impl Simulation {
         } else {
             (0.0, 1)
         };
+        let base = self.wave_block_height(front as i32);
         self.tsunami = Some(Tsunami {
             dir,
             front,
             speed: TSUNAMI_START_SPEED,
             height: TSUNAMI_START_HEIGHT,
+            base,
+            age: 0,
         });
     }
 
-    /// Advance the active tsunami one tick: quicken and build the crest, roll it
-    /// forward, stamp the moving wall of water, and drive a gust ahead of it so
-    /// the flood it has already laid down surges along rather than just levelling.
-    /// Clears the tsunami once the crest rolls off the far edge. A no-op when no
-    /// tsunami is in progress.
+    #[cfg(test)]
+    pub(crate) fn tsunami_debug(&self) -> Option<(f32, i32, f32)> {
+        self.tsunami.map(|t| (t.front, t.dir, t.height))
+    }
+
+    /// Advance the active tsunami one tick: quicken and build the surge, run it
+    /// forward *along the land surface*, lay down its travelling wall of water, and
+    /// drive a gust through it so the flood rushes along rather than just levelling.
+    ///
+    /// The surge carries `height` cells of water above whatever ground it's running
+    /// over. It climbs up and over any rise shorter than that, but where the land
+    /// ahead rears up *taller* than the surge can climb — a hill, a ridge, a
+    /// headland — the water slams into that face and rebounds the way it came,
+    /// recoiling taller and throwing a sheet of water skyward, instead of carrying
+    /// its flood on into the valley beyond. Clears the tsunami once it runs off the
+    /// far edge. A no-op when no tsunami is in progress.
     fn advance_tsunami(&mut self) {
         let Some(mut t) = self.tsunami else {
             return;
         };
 
-        // Build and quicken: the wave grows taller and faster as it rolls, up to
-        // its caps.
-        t.height = (t.height + TSUNAMI_GROWTH).min(TSUNAMI_MAX_HEIGHT);
-        t.speed = (t.speed + TSUNAMI_ACCEL).min(TSUNAMI_MAX_SPEED);
-        t.front += t.speed * t.dir as f32;
-
-        let fx = t.front.round() as i32;
-        // Rolled off the far edge: the wave is spent, leaving its flood behind.
-        if fx < 0 || fx >= self.width as i32 {
+        // Run its course: an old wave has spent itself and subsides into its flood.
+        t.age += 1;
+        if t.age > TSUNAMI_LIFETIME {
             self.tsunami = None;
             return;
         }
 
-        // Stamp the crest as a band of columns (as wide as a tick's travel, so a
-        // fast wave leaves no gaps) filled with water from the floor up to the
-        // crest height. The wave fills open air and tears out anything light
-        // enough to be swept away — the wood and leaves of trees, which it rips up
-        // and carries off as water. Solid ground (stone, soil) stands fast, so the
-        // flood rolls *over* the land rather than carving through it; and a column
-        // already full to the crest stops taking water, which keeps the flood from
-        // running away.
-        let crest = t.height as i32;
+        // Build and quicken: the surge gathers depth and speed as it rolls, to caps.
+        t.height = (t.height + TSUNAMI_GROWTH).min(TSUNAMI_MAX_HEIGHT);
+        t.speed = (t.speed + TSUNAMI_ACCEL).min(TSUNAMI_MAX_SPEED);
+        let surge = t.height as i32;
+
+        // The water tops out `surge` cells above the basin floor the wave is riding
+        // (`base`). It floods everything below that line and presses on over it; but
+        // where the land ahead rears up *to or above* the waterline the water can't
+        // climb it — that's a hillside to rebound off, not roll through. Scan the
+        // columns this tick's travel will sweep for the first such blocking ground.
+        let start = t.front.round() as i32;
+        let water_level = t.base + surge;
+        let new_front = (t.front + t.speed * t.dir as f32).round() as i32;
+        let mut wall_at = None;
+        let mut cx = start + t.dir;
+        while cx != new_front + t.dir && cx >= 0 && cx < self.width as i32 {
+            if self.wave_block_height(cx) >= water_level {
+                wall_at = Some(cx);
+                break;
+            }
+            cx += t.dir;
+        }
+
+        // The surge back-fills the columns it just ran over, which trail in the
+        // direction it was *heading*. On a rebound that's the near side of the hill
+        // (where the water heaps up), not the slope itself — so the band is laid down
+        // with the pre-rebound heading, captured here before the flip.
+        let band_dir = t.dir;
+        let bounced = wall_at.is_some();
+        if let Some(wcx) = wall_at {
+            // Slam into the hillside: the surge piles up against the face it can't
+            // climb, then reverses and tears back the way it came at full pelt. Some
+            // of its bulk is lost up the slope and to spray, so it recoils a little
+            // shallower each time — sloshing back and forth between the hills it's
+            // penned by, fading with every blow until it finally subsides. Its
+            // footing resets to the ground it now rebounds away across.
+            t.front = (wcx - t.dir) as f32;
+            t.dir = -t.dir;
+            t.height *= TSUNAMI_BOUNCE_DAMP;
+            t.speed = TSUNAMI_MAX_SPEED;
+            t.base = self.wave_block_height(t.front as i32);
+            if t.height < TSUNAMI_MIN_HEIGHT {
+                // Spent: the last of its energy gone, the wave subsides into the
+                // flood it has left across the land.
+                self.tsunami = None;
+                return;
+            }
+        } else {
+            t.front += t.speed * t.dir as f32;
+            // Track the lowest ground crossed: descending into a hollow lowers the
+            // footing (and the flood line with it); climbing a slope leaves it put,
+            // so the rise accumulates toward an eventual rebound.
+            t.base = t.base.min(self.wave_block_height(t.front as i32));
+        }
+
+        // Reached the world's edge: reflect off it rather than running off, so the
+        // wave stays in play and sloshes back, fading with the blow, instead of the
+        // flood vanishing over the rim. (It still ends in time — see the depth and
+        // lifetime checks.)
+        let mut fx = t.front.round() as i32;
+        if fx < 0 || fx >= self.width as i32 {
+            t.dir = -t.dir;
+            t.front = fx.clamp(0, self.width as i32 - 1) as f32;
+            t.height *= TSUNAMI_BOUNCE_DAMP;
+            t.base = self.wave_block_height(t.front as i32);
+            if t.height < TSUNAMI_MIN_HEIGHT {
+                self.tsunami = None;
+                return;
+            }
+            fx = t.front.round() as i32;
+        }
+
+        // Lay the surge down as a band of columns (as wide as a tick's travel, so a
+        // fast wave leaves no gaps), flooding each from its ground surface up to the
+        // flat waterline. The water fills open air and tears out anything light
+        // enough to be swept away — the wood and leaves of trees, ripped up and
+        // carried off as water — while solid ground stands fast.
+        let water_level = t.base + t.height as i32;
         let thickness = t.speed.ceil() as i32;
         for back in 0..thickness {
-            let cx = fx - t.dir * back;
-            if cx < 0 || cx >= self.width as i32 {
+            let col = fx - band_dir * back;
+            if col < 0 || col >= self.width as i32 {
                 continue;
             }
-            let cx = cx as usize;
-            for dy in 0..crest {
+            let col = col as usize;
+            let ground = self.wave_block_height(col as i32);
+            for dy in ground..water_level {
                 let y = self.height as i32 - 1 - dy;
                 if y < 0 {
                     break;
                 }
                 let y = y as usize;
-                let m = self.mat_at(cx, y);
+                let m = self.mat_at(col, y);
                 if m == materials::EMPTY || m == materials::WOOD || m == materials::LEAVES {
-                    self.set(cx, y, materials::WATER);
+                    self.set(col, y, materials::WATER);
                 }
             }
         }
 
-        // Drive a strong gust through the body of the wave so the water it has
-        // already flooded surges forward with the crest instead of settling flat.
-        let cy = self.height as i32 - 1 - crest / 2;
-        self.add_wind_disk(fx, cy, crest, TSUNAMI_GUST * t.dir, 0);
+        // Drive a strong gust through the body of the surge so the water it lays
+        // down rushes along with the wave instead of settling flat. The disk sits on
+        // the wall of water at the front. On a rebound the gust reverses with the
+        // wave and gains a fierce upward kick, throwing a sheet of water back and
+        // skyward off the hillside.
+        let radius = (water_level - t.base).max(TSUNAMI_GUST_RADIUS);
+        let cy = self.height as i32 - 1 - (t.base + radius / 2);
+        let lift = if bounced { -TSUNAMI_BOUNCE_LIFT } else { 0 };
+        self.add_wind_disk(fx, cy, radius, TSUNAMI_GUST * t.dir, lift);
 
         self.tsunami = Some(t);
     }
@@ -755,6 +868,34 @@ impl Simulation {
     #[inline]
     pub(crate) fn mat_at(&self, x: usize, y: usize) -> MaterialId {
         self.cells[self.idx(x, y)].mat
+    }
+
+    /// Height, in cells above the floor, of the contiguous stack of *wave-blocking*
+    /// material in column `x` — the solid stuff a tsunami can neither tear through
+    /// nor wash away: stone, soil, and the like. The count rises from the floor and
+    /// stops at the first cell that's open air, a fluid, or something the wave
+    /// sweeps off (the wood and leaves of trees). Used by
+    /// [`advance_tsunami`](Self::advance_tsunami) to spot a wall in the wave's path:
+    /// a sheer barrier piercing the flood surface that the water can't get past.
+    fn wave_block_height(&self, x: i32) -> i32 {
+        if x < 0 || x >= self.width as i32 {
+            return self.height as i32; // the world edge reads as a full solid face
+        }
+        let x = x as usize;
+        let mut h = 0;
+        while h < self.height as i32 {
+            let y = self.height as i32 - 1 - h;
+            let m = self.mat_at(x, y as usize);
+            if m == materials::EMPTY
+                || m == materials::WOOD
+                || m == materials::LEAVES
+                || self.infos[m as usize].movable
+            {
+                break;
+            }
+            h += 1;
+        }
+        h
     }
 
     /// The material id at `(x, y)`, or `None` if the coordinates fall outside the
@@ -1576,6 +1717,51 @@ mod tests {
     }
 
     #[test]
+    fn a_tsunami_bounces_off_a_wall_instead_of_passing_through() {
+        // A full-height stone wall stands across the wave's path. Breaking from the
+        // left and rolling right, the crest should slam into the wall and rebound
+        // rather than wash straight through it: the world *left* of the wall floods,
+        // the far side beyond it stays bone dry, and the spent wave rolls back off
+        // the near edge it came from.
+        const STONE: MaterialId = 2;
+        let mut sim = Simulation::new();
+        let wall_x = 3 * GRID_W / 4;
+        for x in wall_x..wall_x + 3 {
+            for y in 0..GRID_H {
+                sim.set(x, y, STONE);
+            }
+        }
+
+        // Target past the wall so the wave breaks from the left edge and bears down
+        // on it.
+        sim.spawn_tsunami(GRID_W as i32 - 1, GRID_H as i32 / 2);
+        for _ in 0..400 {
+            sim.step();
+        }
+
+        let dry_far_side =
+            (wall_x + 3..GRID_W).all(|x| (0..GRID_H).all(|y| sim.mat_at(x, y) != WATER));
+        assert!(
+            dry_far_side,
+            "no water should make it past the wall — the wave must bounce, not pass through"
+        );
+
+        let near_flood = (0..wall_x)
+            .flat_map(|x| (0..GRID_H).map(move |y| (x, y)))
+            .filter(|&(x, y)| sim.mat_at(x, y) == WATER)
+            .count();
+        assert!(
+            near_flood > 2000,
+            "the side the wave struck from should be flooded, got {near_flood}"
+        );
+
+        assert!(
+            sim.tsunami.is_none(),
+            "the rebounding wave should roll back off the edge and be spent"
+        );
+    }
+
+    #[test]
     fn a_gamma_ray_burst_annihilates_a_column() {
         // Fill a tall column of solid stone, then call a burst down on it. The
         // beam should bore a clean vacuum channel straight through — stone and
@@ -1648,6 +1834,32 @@ mod tests {
         assert!(
             width > 1,
             "sand should tumble into a pile, got width {width}"
+        );
+    }
+    #[test]
+    fn a_tsunami_rebounds_off_the_terrain() {
+        // On natural terrain the surge runs inland, rears up against a hillside too
+        // tall to climb, and rebounds — reversing direction — instead of carrying
+        // its flood straight through the high ground into the valley beyond.
+        let mut sim = Simulation::new();
+        crate::worldgen::generate(&mut sim, 7);
+        sim.spawn_tsunami(GRID_W as i32 - 1, GRID_H as i32 / 2);
+
+        let (_, mut prev_dir, _) = sim.tsunami_debug().expect("summoning starts a tsunami");
+        let mut rebounded = false;
+        for _ in 0..300 {
+            sim.step();
+            let Some((_, dir, _)) = sim.tsunami_debug() else {
+                break; // the wave has spent itself
+            };
+            if dir != prev_dir {
+                rebounded = true;
+                prev_dir = dir;
+            }
+        }
+        assert!(
+            rebounded,
+            "the wave should rebound off the terrain, not roll straight through it"
         );
     }
 }
