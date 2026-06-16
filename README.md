@@ -13,6 +13,16 @@ seed-based world generator; and a Rhai scripting plugin system for adding your
 own materials at runtime — all on top of an architecture where adding more is
 meant to be easy.
 
+## Screenshots and GIFs
+#### Tsunami
+<img width="500" height="250" alt="tsunami" src="https://github.com/user-attachments/assets/f76a8e4e-5e27-4031-8c08-b3537ad0e1a7" />
+
+#### Meteors
+<img width="500" height="250" alt="meteors" src="https://github.com/user-attachments/assets/5962e9d4-c842-4921-8fa1-29513f1c013a" />
+
+#### Gamma Rays
+<img width="500" height="250" alt="gamma-rays" src="https://github.com/user-attachments/assets/7684a73a-cdb1-4bf9-888b-14cc0254f803" />
+
 ## Materials
 
 Painted from the on-screen picker (or the number-key shortcuts):
@@ -198,6 +208,7 @@ needs to change — it dispatches through the trait. Both files have comments
 marking where these go. Adding a creature works the same way under `entities/`.
 
 ## Adding a material *without* recompiling — Rhai plugins
+
 
 The material registry is built at runtime, so you can add a material from a
 small [Rhai](https://rhai.rs) script and have it show up in the picker like any
