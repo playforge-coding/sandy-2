@@ -331,6 +331,9 @@ impl App {
         // Step the sim and draw the scene + UI.
         if let Some(state) = &mut self.state {
             state.update();
+            // A recording can auto-stop on its own when it hits the frame cap;
+            // mirror the live state back so the button label stays in sync.
+            self.input.controls.recording = state.is_recording();
             state.render(
                 paint_jobs,
                 full_output.textures_delta,
@@ -386,6 +389,16 @@ impl App {
         }
         if actions.randomize {
             self.randomize_seed();
+        }
+        if actions.screenshot {
+            if let Some(state) = &mut self.state {
+                state.screenshot();
+            }
+        }
+        if actions.record_toggle {
+            if let Some(state) = &mut self.state {
+                self.input.controls.recording = state.toggle_recording();
+            }
         }
     }
 

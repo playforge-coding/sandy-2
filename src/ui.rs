@@ -61,6 +61,10 @@ pub struct Controls {
     pub seed: String,
     /// Which landscape preset the next generation builds.
     pub world: WorldType,
+    /// Whether a GIF recording is currently running. Owned by the GPU state (see
+    /// [`crate::gpu::State::is_recording`]); mirrored here each frame so the
+    /// Record button can show its on/off label.
+    pub recording: bool,
 }
 
 impl Default for Controls {
@@ -72,6 +76,7 @@ impl Default for Controls {
             brush: 4,
             seed: crate::worldgen::DEFAULT_SEED.to_string(),
             world: WorldType::default(),
+            recording: false,
         }
     }
 }
@@ -96,6 +101,10 @@ pub struct Actions {
     pub clear: bool,
     pub generate: bool,
     pub randomize: bool,
+    /// Save a PNG snapshot of the world right now.
+    pub screenshot: bool,
+    /// Start a GIF recording, or stop (and save) the one in progress.
+    pub record_toggle: bool,
 }
 
 /// Build the control panel for this frame and report which buttons were hit.
@@ -246,6 +255,24 @@ pub fn draw(ctx: &egui::Context, c: &mut Controls) -> Actions {
                 actions.randomize |= ui.button("Random").clicked();
                 actions.clear |= ui.button("Clear").clicked();
             });
+
+            ui.separator();
+            // Capture tools: a still PNG, and a GIF recorder that toggles.
+            ui.label("Capture");
+            actions.screenshot |= ui
+                .add(egui::Button::new("📷 Screenshot").min_size(button_size))
+                .clicked();
+            let rec_label = if c.recording {
+                "⏹ Stop recording"
+            } else {
+                "⏺ Record GIF"
+            };
+            let mut rec_btn = egui::Button::new(rec_label).min_size(button_size);
+            if c.recording {
+                // A red outline while recording, echoing the familiar REC cue.
+                rec_btn = rec_btn.stroke(Stroke::new(2.0, Color32::from_rgb(220, 50, 50)));
+            }
+            actions.record_toggle |= ui.add(rec_btn).clicked();
 
             ui.separator();
             ui.label(

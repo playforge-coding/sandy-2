@@ -9,9 +9,11 @@
 //! - `plugin`     — sandboxed Rhai scripts that add new materials at runtime.
 //! - `worldgen`   — seed-based terrain/tree generation (FastNoise Lite).
 //! - `app`        — winit window/input/event loop.
+//! - `capture`    — screenshot / GIF recording of the rendered grid.
 
 mod app;
 mod behaviors;
+mod capture;
 mod entities;
 mod gpu;
 mod materials;

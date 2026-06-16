@@ -35,8 +35,17 @@ fastnoise-lite = "1.1.1"
 # A drop-in `std::time::Instant` that also works on wasm (backed by the browser's
 # `performance.now()`); `std`'s `Instant::now()` panics on wasm32. Drives the
 # fixed-timestep sim clock so the game runs at the same speed on every platform
-# regardless of the display's refresh rate.
+# regardless of the display's refresh rate. Its `SystemTime` (also wasm-safe)
+# stamps unique capture filenames.
 web-time = "1.1"
+# Screenshot / GIF capture encoders. Both are pure Rust (no C deps), so the same
+# code path encodes images on desktop and in the browser (see `capture`).
+png = "0.17"
+gif = "0.13"
+# NeuQuant colour quantiser (also a `gif` dependency). Used directly to build a
+# single saturation-weighted palette across a recording, so rare-but-vivid
+# colours (fire, lava, meteors) aren't collapsed onto the common grays/browns.
+color_quant = "1.1"
 
 # ---- Desktop only ----
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -61,6 +70,18 @@ wasm-bindgen = "=0.2.122"
 wasm-bindgen-futures = "0.4"
 console_error_panic_hook = "0.1"
 console_log = "1"
+# Browser glue for delivering a capture as a download: wrap the encoded bytes in
+# a Blob and click a temporary <a download> (see `capture::deliver`).
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "Blob",
+    "Url",
+    "Window",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlAnchorElement",
+] }
 
 [profile.release]
 opt-level = 3

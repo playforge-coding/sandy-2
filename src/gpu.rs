@@ -28,6 +28,19 @@ const TICKS_PER_SECOND: f64 = 30.0;
 /// Real seconds one simulation tick represents.
 const TICK_DT: f64 = 1.0 / TICKS_PER_SECOND;
 
+/// While a GIF recording runs, sample one frame every this many sim ticks. The
+/// sim ticks at [`TICKS_PER_SECOND`] (30), so a stride of 2 records ~15 fps.
+const GIF_TICK_STRIDE: u32 = 2;
+
+/// Cap on frames a single recording keeps, so a recording left running can't
+/// grow memory without bound. At ~15 fps this is roughly 13 seconds, after which
+/// the recording auto-stops and saves.
+const GIF_MAX_FRAMES: usize = 200;
+
+/// Each GIF frame's on-screen duration, in centiseconds. ~7 cs ≈ the 15 fps the
+/// [`GIF_TICK_STRIDE`] sampling captures at.
+const GIF_DELAY_CS: u16 = 7;
+
 /// Upper bound on the real time a single frame may contribute to the tick
 /// accumulator. Without it, a long stall (a backgrounded tab, a debugger pause,
 /// a slow first frame) would bank a huge backlog and the next `update` would
@@ -73,6 +86,14 @@ pub struct State {
     /// with `last_update` this decouples sim speed from the frame rate: real
     /// elapsed time is banked here and spent one fixed `TICK_DT` step at a time.
     tick_accumulator: f64,
+
+    /// Whether a GIF recording is currently running.
+    recording: bool,
+    /// Frames captured so far this recording (each a clone of `pixels`). Empty
+    /// when not recording; encoded and cleared on stop.
+    rec_frames: Vec<Vec<u8>>,
+    /// Counts sampled ticks so we keep only every [`GIF_TICK_STRIDE`]-th frame.
+    rec_tick: u32,
 
     pub sim: Simulation,
 }
@@ -520,6 +541,9 @@ impl State {
             egui_renderer,
             last_update: web_time::Instant::now(),
             tick_accumulator: 0.0,
+            recording: false,
+            rec_frames: Vec::new(),
+            rec_tick: 0,
             sim,
         }
     }
@@ -611,6 +635,65 @@ impl State {
                 depth_or_array_layers: 1,
             },
         );
+
+        // `pixels` now holds this tick's freshly-rendered grid — the moment to
+        // grab a recording frame, so the GIF samples genuine simulation steps.
+        if self.recording {
+            if self.rec_tick % GIF_TICK_STRIDE == 0 {
+                self.rec_frames.push(self.pixels.clone());
+            }
+            self.rec_tick += 1;
+            if self.rec_frames.len() >= GIF_MAX_FRAMES {
+                log::info!("recording hit the {GIF_MAX_FRAMES}-frame cap; saving");
+                self.stop_recording();
+            }
+        }
+    }
+
+    /// Save a PNG of the current grid (a file on desktop, a download on the web).
+    pub fn screenshot(&mut self) {
+        // Re-render so a screenshot taken between ticks still reflects the grid.
+        self.sim.render_into(&mut self.pixels);
+        let png = crate::capture::encode_png(&self.pixels, GRID_W as u32, GRID_H as u32);
+        crate::capture::deliver(&png, &crate::capture::filename("png"), "image/png");
+    }
+
+    /// Whether a GIF recording is currently running.
+    pub fn is_recording(&self) -> bool {
+        self.recording
+    }
+
+    /// Flip recording on or off. Starting clears the frame buffer; stopping
+    /// encodes the captured frames to a GIF and saves it. Returns the new state.
+    pub fn toggle_recording(&mut self) -> bool {
+        if self.recording {
+            self.stop_recording();
+        } else {
+            self.recording = true;
+            self.rec_frames.clear();
+            self.rec_tick = 0;
+            log::info!("recording started");
+        }
+        self.recording
+    }
+
+    /// End a recording: encode whatever frames were captured to a GIF and save
+    /// it. A no-op for the frames if none were captured.
+    fn stop_recording(&mut self) {
+        self.recording = false;
+        if self.rec_frames.is_empty() {
+            log::info!("recording stopped (no frames captured)");
+            return;
+        }
+        log::info!("encoding GIF from {} frames…", self.rec_frames.len());
+        let gif = crate::capture::encode_gif(
+            &self.rec_frames,
+            GRID_W as u32,
+            GRID_H as u32,
+            GIF_DELAY_CS,
+        );
+        crate::capture::deliver(&gif, &crate::capture::filename("gif"), "image/gif");
+        self.rec_frames.clear();
     }
 
     /// Draw the grid texture to the window, blooming the emissive cells, then
