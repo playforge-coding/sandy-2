@@ -91,17 +91,14 @@ const TSUNAMI_MAX_SPEED: f32 = 6.0;
 /// How much the surge speeds up each tick (cells per tick²): the wave *quickens*
 /// as it rolls, just as a real one steepens running into the shallows.
 const TSUNAMI_ACCEL: f32 = 0.06;
-/// The surge's starting *depth*, in cells of water carried above the ground it runs
-/// over — the height of the travelling wall of water, measured from the local land
-/// surface (not the floor). The wave runs up and over anything shorter than this
-/// and rebounds off anything taller. It builds from here as it rolls.
-const TSUNAMI_START_HEIGHT: f32 = 26.0;
 /// How many cells deeper the surge grows each tick as it gathers — capped at
 /// [`TSUNAMI_MAX_HEIGHT`].
 const TSUNAMI_GROWTH: f32 = 0.12;
-/// Ceiling on the surge depth, in cells. Kept modest so the wave still rebounds off
-/// the taller hills and headlands rather than eventually drowning every one.
-const TSUNAMI_MAX_HEIGHT: f32 = 46.0;
+/// Ceiling on the surge depth, in cells — the depth of the largest wave a click can
+/// summon (aim high in the sky for one this tall). Big enough that a full-height
+/// wave rolls clean over the forest's rolling hills and tears through the trees
+/// inland; only the very tallest headlands still turn it back.
+const TSUNAMI_MAX_HEIGHT: f32 = 120.0;
 /// Strength of the gust the surge drives through itself, in velocity sub-units.
 /// Well past the liquid-flow threshold (see [`crate::behaviors`]) so the water it
 /// lays down rushes along with the wave rather than just levelling.
@@ -185,8 +182,14 @@ struct Tsunami {
     /// tick toward [`TSUNAMI_MAX_SPEED`].
     speed: f32,
     /// The surge's current *depth*, in cells of water carried above the ground it
-    /// runs over. Grows each tick toward [`TSUNAMI_MAX_HEIGHT`].
+    /// runs over. Grows each tick toward [`cap`](Self::cap).
     height: f32,
+    /// The depth this surge builds toward, set from how high the user clicked when
+    /// summoning it (see [`Simulation::spawn_tsunami`]) — a low click makes a modest
+    /// swell that stays modest, a high one a towering wall. Bounded by
+    /// [`TSUNAMI_MAX_HEIGHT`] so even the tallest wave still rebounds off the high
+    /// ground rather than drowning it.
+    cap: f32,
     /// The ground height (above the floor) of the basin the surge is currently
     /// running through — its footing. The water tops out `height` cells above this,
     /// so the wave floods everything below that line and rebounds off any land that
@@ -627,12 +630,16 @@ impl Simulation {
         self.set_velocity(sx, 0, vx, vy);
     }
 
-    /// Summon a tsunami headed toward `(target_x, _)`: a wall of water breaks in
-    /// from the far side of the world and rolls *toward* the clicked spot (and on
-    /// across, off the near edge), the crest building higher and the surge
-    /// quickening as it travels (see [`Tsunami`]). Replaces any tsunami already in
-    /// progress. An off-grid target is ignored.
-    pub fn spawn_tsunami(&mut self, target_x: i32, _target_y: i32) {
+    /// Summon a tsunami headed toward `(target_x, target_y)`: a wall of water
+    /// breaks in from the far side of the world and rolls *toward* the clicked
+    /// spot (and on across, off the near edge), the crest building higher and the
+    /// surge quickening as it travels (see [`Tsunami`]). The wave breaks at the
+    /// height the user clicked — its starting depth is how far above the floor
+    /// `target_y` sits, so clicking high in the sky rears up a towering wall and
+    /// clicking near the ground sends a modest swell, clamped to the surge's
+    /// usual depth range. Replaces any tsunami already in progress. An off-grid
+    /// target is ignored.
+    pub fn spawn_tsunami(&mut self, target_x: i32, target_y: i32) {
         if target_x < 0 || target_x as usize >= self.width {
             return;
         }
@@ -644,11 +651,20 @@ impl Simulation {
             (0.0, 1)
         };
         let base = self.wave_block_height(front as i32);
+        // The wave's full depth follows the click's height above the floor, so the
+        // user dials its size by where they aim it vertically — and it *keeps* that
+        // size, building toward its own cap rather than the global one, so the
+        // difference between a high and a low click persists the whole way across.
+        let above_floor = (self.height as i32 - 1 - target_y).max(0) as f32;
+        let cap = above_floor.clamp(TSUNAMI_MIN_HEIGHT, TSUNAMI_MAX_HEIGHT);
+        // Break at a fraction of that so the surge still visibly rears up as it rolls.
+        let height = (cap * 0.6).max(TSUNAMI_MIN_HEIGHT).min(cap);
         self.tsunami = Some(Tsunami {
             dir,
             front,
             speed: TSUNAMI_START_SPEED,
-            height: TSUNAMI_START_HEIGHT,
+            height,
+            cap,
             base,
             age: 0,
         });
@@ -683,7 +699,7 @@ impl Simulation {
         }
 
         // Build and quicken: the surge gathers depth and speed as it rolls, to caps.
-        t.height = (t.height + TSUNAMI_GROWTH).min(TSUNAMI_MAX_HEIGHT);
+        t.height = (t.height + TSUNAMI_GROWTH).min(t.cap);
         t.speed = (t.speed + TSUNAMI_ACCEL).min(TSUNAMI_MAX_SPEED);
         let surge = t.height as i32;
 
@@ -2004,7 +2020,9 @@ mod tests {
         // its flood straight through the high ground into the valley beyond.
         let mut sim = Simulation::new();
         crate::worldgen::generate(&mut sim, 7);
-        sim.spawn_tsunami(GRID_W as i32 - 1, GRID_H as i32 / 2);
+        // A modest wave (summoned by a click low to the ground) — tall enough to
+        // run inland but not to drown the hills, so it rears up and rebounds.
+        sim.spawn_tsunami(GRID_W as i32 - 1, GRID_H as i32 - 47);
 
         let (_, mut prev_dir, _) = sim.tsunami_debug().expect("summoning starts a tsunami");
         let mut rebounded = false;
