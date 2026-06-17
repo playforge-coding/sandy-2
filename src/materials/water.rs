@@ -20,6 +20,9 @@ impl Material for Water {
             density: 100,
             movable: true,
             glow: false,
+            // A body of water is a cool sink: it draws its surroundings down
+            // toward a chilly few degrees, so ponds and seas temper the heat.
+            source_temp: Some(8.0),
         }
     }
 

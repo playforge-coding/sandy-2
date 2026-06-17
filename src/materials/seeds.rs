@@ -28,6 +28,7 @@ impl Material for Seeds {
             density: 120,
             movable: true,
             glow: false,
+            source_temp: None,
         }
     }
 

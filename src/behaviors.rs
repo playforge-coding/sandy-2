@@ -262,6 +262,46 @@ pub fn ballistic(
 /// Immovable: never moves. Used by stone, walls, bedrock.
 pub fn solid(_sim: &mut Simulation, _x: usize, _y: usize) {}
 
+/// A heavy rigid solid: falls *straight* down under gravity and nothing else.
+///
+/// Unlike a [`powder`], it never tumbles diagonally, so a poured metal casting
+/// keeps its shape and drops as a block instead of slumping into a pile — the
+/// "doesn't separate from its original form" of the metals. It accelerates as it
+/// drops (the stored downward velocity climbs by `gravity` sub-units each tick it
+/// keeps falling), and it crushes any creature it falls onto: creatures ride
+/// *over* the grid, so the metal would otherwise pass straight through one, but
+/// [`Simulation::crush_entities_at`] reaps whatever is in the cell it drops into.
+///
+/// Returns `Some(impact)` — the downward speed it struck at, in velocity
+/// sub-units — on the single tick it lands on something it can't fall through, so
+/// the caller can spend that energy on a landing effect (tungsten denting the
+/// stone beneath it). Returns `None` while it's still falling or already at rest.
+/// On landing the stored velocity is zeroed, so a caller that wants the block to
+/// keep punching downward must re-arm it (see `tungsten`).
+pub fn falling_metal(sim: &mut Simulation, x: usize, y: usize, gravity: i32) -> Option<i32> {
+    // Resting on the floor: nothing below to fall into.
+    if y + 1 >= sim.height {
+        sim.set_velocity(x, y, 0, 0);
+        return None;
+    }
+    let (_, vy) = sim.velocity(x, y);
+    // Straight down — `try_move` lets it sink through anything lighter (water,
+    // lava) and blocks on anything solid (stone, another metal).
+    if sim.try_move(x, y, x, y + 1) {
+        sim.crush_entities_at(x, y + 1);
+        // Heavier the longer it falls; clamped into the i8 the cell stores.
+        sim.set_velocity(x, y + 1, 0, (vy + gravity).min(i8::MAX as i32));
+        return None;
+    }
+    // Blocked below: it has landed. Report the speed it hit at, then come to rest.
+    sim.set_velocity(x, y, 0, 0);
+    if vy > 0 {
+        Some(vy)
+    } else {
+        None
+    }
+}
+
 /// Powder: fall straight down; if blocked, tumble diagonally so the material
 /// settles into a pile at its angle of repose. Used by sand, and any future
 /// dirt/ash/salt/gunpowder.

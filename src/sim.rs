@@ -135,6 +135,39 @@ const BURST_RADIUS: i32 = 7;
 /// The flames linger in the carved channel and burn out on their own.
 const BURST_FIRE_TIP: i32 = 5;
 
+/// Temperature-field resolution: the world's heat is tracked not per cell — that
+/// would roughly double the grid's per-tick memory traffic for no visible gain —
+/// but on a coarse grid of square tiles, each [`TEMP_TILE`] cells on a side.
+/// Materials deposit heat into the tile they occupy as the normal scan passes
+/// over them, the field then conducts between neighbouring tiles and relaxes
+/// toward the world's ambient temperature, and any cell reads its local
+/// temperature straight back from its tile (see [`Simulation::temp_at`]). A power
+/// of two so the cell→tile map is a bit-shift rather than a divide.
+pub(crate) const TEMP_TILE: usize = 8;
+const TEMP_SHIFT: usize = 3; // log2(TEMP_TILE)
+const TEMP_W: usize = GRID_W.div_ceil(TEMP_TILE);
+const TEMP_H: usize = GRID_H.div_ceil(TEMP_TILE);
+
+/// How hard a single heat-source cell drags its tile toward that material's own
+/// temperature each tick. Deliberately tiny: one stray hot cell barely warms its
+/// 64-cell tile (so a thin lava trickle is overwhelmed by a cold world and cools
+/// to stone), but the contribution compounds with the number of source cells in
+/// the tile, so a tile packed with lava is pinned near molten — the difference
+/// between a stray spark and a lava lake.
+const TEMP_SOURCE_RATE: f32 = 0.003;
+/// Fraction of the gap to its neighbours' mean a tile closes each tick — heat
+/// conduction, which spreads a hot-spot into the tiles around it.
+const TEMP_DIFFUSE: f32 = 0.18;
+/// Fraction of the gap to the world's ambient temperature a tile closes each
+/// tick. Gentle, so heat lingers a while, but everything drifts back to the
+/// preset's climate once the source is gone.
+const TEMP_RELAX: f32 = 0.06;
+
+/// The temperature an empty, source-less world sits at before a preset picks a
+/// climate — a mild room temperature, matching the default [`crate::worldgen`]
+/// Forest preset.
+pub(crate) const DEFAULT_WORLD_TEMP: f32 = 20.0;
+
 /// A natural disaster in progress: a surge of water that rushes across the world
 /// from one side, running up and over the land, quickening and deepening as it
 /// goes — until it rears up against a hillside too tall to climb and rebounds, or
@@ -222,6 +255,22 @@ pub struct Simulation {
     /// cells. Stepped after the grid each tick (see [`Simulation::step_entities`])
     /// and drawn as an overlay (see [`Simulation::render_into`]).
     entities: Vec<EntityState>,
+    /// The world's ambient temperature — the climate the preset picked (see
+    /// [`crate::worldgen`]). Every temperature tile relaxes back toward this, so
+    /// it's the baseline a desert bakes at or an ocean chills to.
+    world_temp: f32,
+    /// The coarse temperature field: one value per [`TEMP_TILE`]-square tile,
+    /// `TEMP_W * TEMP_H` of them. This is the local temperature everything reads
+    /// (see [`temp_at`]); it's grown by heat sources, conducts between tiles, and
+    /// relaxes toward [`world_temp`] each tick in [`update_temperature`].
+    ///
+    /// [`temp_at`]: Simulation::temp_at
+    /// [`world_temp`]: Simulation::world_temp
+    /// [`update_temperature`]: Simulation::update_temperature
+    temp: Vec<f32>,
+    /// Double-buffer scratch for the temperature diffusion pass, kept around so
+    /// the per-tick conduction sweep allocates nothing.
+    temp_scratch: Vec<f32>,
 }
 
 impl Simulation {
@@ -240,6 +289,9 @@ impl Simulation {
             gamma_burst: None,
             infos: Self::snapshot_infos(),
             entities: Vec::new(),
+            world_temp: DEFAULT_WORLD_TEMP,
+            temp: vec![DEFAULT_WORLD_TEMP; TEMP_W * TEMP_H],
+            temp_scratch: vec![DEFAULT_WORLD_TEMP; TEMP_W * TEMP_H],
         }
     }
 
@@ -312,6 +364,82 @@ impl Simulation {
     #[inline]
     fn idx(&self, x: usize, y: usize) -> usize {
         y * self.width + x
+    }
+
+    /// The temperature tile a cell falls in.
+    #[inline]
+    fn tile_idx(&self, x: usize, y: usize) -> usize {
+        (y >> TEMP_SHIFT) * TEMP_W + (x >> TEMP_SHIFT)
+    }
+
+    /// The local temperature at `(x, y)`: the value of the [`TEMP_TILE`]-square
+    /// heat tile the cell sits in. This is the "local temp" materials and
+    /// creatures key their heat behaviour off — a blend of the world's ambient
+    /// climate and whatever hot or cold material is nearby (a lava lake in the
+    /// desert reads scorching; an oasis pool reads cool). Cheap: one shift-indexed
+    /// array read, no per-cell simulation.
+    #[inline]
+    pub(crate) fn temp_at(&self, x: usize, y: usize) -> f32 {
+        self.temp[self.tile_idx(x, y)]
+    }
+
+    /// The world's ambient temperature (the preset's climate). Every tile relaxes
+    /// toward this; see [`set_world_temp`](Self::set_world_temp).
+    #[inline]
+    pub fn world_temp(&self) -> f32 {
+        self.world_temp
+    }
+
+    /// Set the world's ambient temperature and reset the whole heat field to it —
+    /// the climate a freshly-generated world starts uniformly at, before its own
+    /// lava, water and weather warp the local temperatures. Called by
+    /// [`crate::worldgen`] for the chosen preset.
+    pub fn set_world_temp(&mut self, temp: f32) {
+        self.world_temp = temp;
+        self.temp.iter_mut().for_each(|t| *t = temp);
+    }
+
+    /// Nudge the heat tile at `(x, y)` toward `source` — one heat-source cell's
+    /// contribution for this tick. The lerp means many source cells in a tile
+    /// (a lava lake) drive it hard while a lone one barely shifts it; see
+    /// [`TEMP_SOURCE_RATE`].
+    #[inline]
+    fn deposit_heat(&mut self, x: usize, y: usize, source: f32) {
+        let i = self.tile_idx(x, y);
+        self.temp[i] += (source - self.temp[i]) * TEMP_SOURCE_RATE;
+    }
+
+    /// Advance the temperature field one tick: conduct heat between neighbouring
+    /// tiles and relax every tile back toward the world's ambient temperature.
+    /// Source heat is deposited separately, during the main scan (see
+    /// [`step`](Self::step)). Operates on the coarse `TEMP_W * TEMP_H` tile grid,
+    /// so this is a few thousand cheap arithmetic ops a tick — it never shows up
+    /// against the 125k-cell sand scan.
+    fn update_temperature(&mut self) {
+        // Conduct: each tile eases toward the mean of its 4-neighbours (tiles off
+        // the edge mirror this tile, so the border neither gains nor loses heat to
+        // the void). Written into the scratch buffer so every tile reads this
+        // tick's values, then swapped in.
+        for ty in 0..TEMP_H {
+            for tx in 0..TEMP_W {
+                let i = ty * TEMP_W + tx;
+                let here = self.temp[i];
+                let at = |dx: isize, dy: isize| -> f32 {
+                    let nx = tx as isize + dx;
+                    let ny = ty as isize + dy;
+                    if nx < 0 || ny < 0 || nx as usize >= TEMP_W || ny as usize >= TEMP_H {
+                        here
+                    } else {
+                        self.temp[ny as usize * TEMP_W + nx as usize]
+                    }
+                };
+                let neighbour_mean = (at(-1, 0) + at(1, 0) + at(0, -1) + at(0, 1)) * 0.25;
+                let conducted = here + (neighbour_mean - here) * TEMP_DIFFUSE;
+                // Relax toward the world's climate.
+                self.temp_scratch[i] = conducted + (self.world_temp - conducted) * TEMP_RELAX;
+            }
+        }
+        std::mem::swap(&mut self.temp, &mut self.temp_scratch);
     }
 
     /// Cheap xorshift32, then a coin flip from it. Used by behaviours for
@@ -751,6 +879,10 @@ impl Simulation {
         self.gamma_burst = None;
         // And clear out the wildlife: a cleared world is empty of creatures too.
         self.entities.clear();
+        // Reset the heat field to the ambient climate — no lava or sun left to
+        // warp it. (The world temperature itself is the preset's, so keep it.)
+        let ambient = self.world_temp;
+        self.temp.iter_mut().for_each(|t| *t = ambient);
     }
 
     /// Advance the wind one tick: refresh the ambient breeze and fade any gusts.
@@ -810,11 +942,21 @@ impl Simulation {
                     continue;
                 }
                 let id = cell.mat;
+                // Heat sources/sinks warm or cool the tile they sit in as the
+                // scan reaches them — piggybacking on the scan we're already
+                // doing, so it costs a single tile-indexed lerp per such cell.
+                if let Some(source) = self.infos[id as usize].source_temp {
+                    self.deposit_heat(x, y, source);
+                }
                 // `get` is 'static and doesn't borrow `self`, so the material is
                 // free to take `&mut self` and move cells around.
                 materials::get(id).update(self, x, y);
             }
         }
+
+        // Conduct and relax the temperature field now this tick's sources have
+        // been laid down. Cheap — it runs on the coarse tile grid, not the cells.
+        self.update_temperature();
 
         // Creatures move after the grid has settled for the tick, so they walk
         // and fly over the cells in their just-updated positions.
@@ -1049,6 +1191,22 @@ impl Simulation {
             e.alive = false;
         }
     }
+
+    /// Kill any creature standing in cell `(x, y)` — used by a heavy falling
+    /// material (a metal casting) to crush whatever it drops onto. Creatures
+    /// live *over* the grid rather than in it (see [`entities`]), so a falling
+    /// cell never collides with one through [`try_move`](Self::try_move); this is
+    /// how the squashing is made to happen, called by the metal as it moves down
+    /// into the cell. Several creatures can share a cell, so it reaps every one,
+    /// not just the first.
+    pub(crate) fn crush_entities_at(&mut self, x: usize, y: usize) {
+        let (x, y) = (x as i32, y as i32);
+        for e in self.entities.iter_mut() {
+            if e.alive && e.x.round() as i32 == x && e.y.round() as i32 == y {
+                e.alive = false;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1064,6 +1222,9 @@ mod tests {
     const CLOUD: MaterialId = 10;
 
     const ALGAE: MaterialId = 15;
+    const IRON: MaterialId = 16;
+    const STEEL: MaterialId = 17;
+    const TUNGSTEN: MaterialId = 18;
 
     use crate::entities::{ANT, BIRD, FISH};
 
@@ -1860,6 +2021,275 @@ mod tests {
         assert!(
             rebounded,
             "the wave should rebound off the terrain, not roll straight through it"
+        );
+    }
+
+    /// Box a stone-walled pit `x0..x1` wide, `y0..y1` deep, filled with `mat`,
+    /// open to the air at the top. Mirrors `fill_pool` but for any material, so a
+    /// liquid stays put instead of running off across the floor.
+    fn fill_pit(sim: &mut Simulation, x0: usize, x1: usize, y0: usize, y1: usize, mat: MaterialId) {
+        for x in (x0 - 1)..=x1 {
+            for y in y0..=(y1 + 1) {
+                sim.set(x, y, STONE);
+            }
+        }
+        for x in x0..x1 {
+            for y in y0..y1 {
+                sim.set(x, y, mat);
+            }
+        }
+    }
+
+    #[test]
+    fn world_temperature_follows_the_preset() {
+        // The climate is the preset's: a desert bakes far hotter than a cold sea,
+        // and a fresh world's open air sits at that ambient temperature.
+        use crate::worldgen::{generate_world, WorldType};
+        let mut desert = Simulation::new();
+        generate_world(&mut desert, 1, WorldType::Desert);
+        let mut ocean = Simulation::new();
+        generate_world(&mut ocean, 1, WorldType::Ocean);
+        assert!(
+            desert.world_temp() > ocean.world_temp(),
+            "the desert should be hotter than the ocean ({} vs {})",
+            desert.world_temp(),
+            ocean.world_temp()
+        );
+        // Open sky over the desert reads at (or near) its ambient temperature.
+        assert!(
+            (desert.temp_at(GRID_W / 2, 2) - desert.world_temp()).abs() < 1.0,
+            "empty sky should sit at the world's ambient temperature"
+        );
+    }
+
+    #[test]
+    fn a_temperate_world_keeps_a_lava_lake_molten_and_its_walls_intact() {
+        // In a mild climate a lava lake holds its heat — it stays molten — and it
+        // isn't hot enough to melt the rock that walls it in.
+        let mut sim = Simulation::new(); // default world_temp is temperate (20)
+        fill_pit(&mut sim, 100, 140, 200, 240, LAVA);
+        let lava_before = sim.count_mat(LAVA);
+        let stone_before = sim.count_mat(STONE);
+
+        for _ in 0..600 {
+            sim.step();
+        }
+
+        assert!(
+            sim.count_mat(LAVA) >= lava_before * 9 / 10,
+            "a lava lake in a temperate world should stay molten, {lava_before} -> {}",
+            sim.count_mat(LAVA)
+        );
+        assert!(
+            sim.count_mat(STONE) >= stone_before,
+            "temperate lava isn't hot enough to melt its stone walls"
+        );
+    }
+
+    #[test]
+    fn lava_cools_to_stone_in_a_cold_world() {
+        // A thin run of lava in a bitterly cold world can't hold its warmth: it
+        // crusts over into stone, without ever touching water.
+        let mut sim = Simulation::new();
+        sim.set_world_temp(0.0);
+        // A one-cell-wide lava column walled in stone, so it can't flow away and
+        // there's no water to quench it — only the cold can set it.
+        let cx = 100;
+        for y in 200..240 {
+            sim.set(cx - 1, y, STONE);
+            sim.set(cx + 1, y, STONE);
+            sim.set(cx, y, LAVA);
+        }
+        sim.set(cx, 240, STONE); // floor cap
+        let lava_before = sim.count_mat(LAVA);
+
+        for _ in 0..600 {
+            sim.step();
+        }
+
+        assert!(
+            sim.count_mat(LAVA) <= lava_before / 3,
+            "thin lava in a cold world should cool to stone, {lava_before} -> {}",
+            sim.count_mat(LAVA)
+        );
+    }
+
+    #[test]
+    fn a_desert_lava_lake_melts_the_surrounding_stone() {
+        // The headline case: in a scorching desert, a lava lake is hot enough to
+        // melt the rock it sits against, eating into its stone walls over time.
+        let mut sim = Simulation::new();
+        sim.set_world_temp(45.0); // desert heat
+        fill_pit(&mut sim, 100, 140, 200, 240, LAVA);
+        let stone_before = sim.count_mat(STONE);
+
+        for _ in 0..800 {
+            sim.step();
+        }
+
+        assert!(
+            sim.count_mat(STONE) < stone_before,
+            "a desert lava lake should melt some of the surrounding stone, {stone_before} -> {}",
+            sim.count_mat(STONE)
+        );
+    }
+
+    #[test]
+    fn a_creature_dies_in_the_searing_air_beside_lava() {
+        // Heat kills at a distance: an ant penned on the bank right beside a lava
+        // lake — never standing *in* the lava — is cooked by the scorching air.
+        let mut sim = Simulation::new();
+        let floor = GRID_H - 1;
+        for x in 0..GRID_W {
+            sim.set(x, floor, STONE);
+        }
+        // A broad, deep lava lake, and a stone wall a few cells to its right that
+        // pens an ant into the searing zone beside it.
+        for x in 100..140 {
+            for y in (floor - 10)..floor {
+                sim.set(x, y, LAVA);
+            }
+        }
+        for y in (floor - 6)..floor {
+            sim.set(146, y, STONE);
+        }
+        // Let the heat field build up around the lake first.
+        for _ in 0..80 {
+            sim.step();
+        }
+        // Drop the ant on the bank between the lava (ends at x=139) and the wall.
+        sim.spawn_entity(ANT, 143, floor as i32 - 1);
+        assert_eq!(sim.entity_count(), 1);
+
+        for _ in 0..120 {
+            sim.step();
+        }
+
+        assert_eq!(
+            sim.entity_count(),
+            0,
+            "an ant penned in the searing air beside a lava lake should die of the heat"
+        );
+    }
+
+    #[test]
+    fn a_metal_block_falls_straight_down_without_spreading() {
+        // Unlike a powder, a metal casting keeps its shape as it drops: a single
+        // column of steel falls to the floor and lands as a stack in the same
+        // column, never tumbling sideways into a pile.
+        let mut sim = Simulation::new();
+        let col = 100;
+        for y in 0..6 {
+            sim.set(col, y, STEEL);
+        }
+        let before = sim.count_mat(STEEL);
+        for _ in 0..GRID_H {
+            sim.step();
+        }
+        assert_eq!(sim.count_mat(STEEL), before, "no steel should be lost");
+        // Every steel cell sits in the original column, resting on the floor.
+        for y in 0..GRID_H {
+            let m = sim.mat_at(col, y);
+            if m == STEEL {
+                assert!(
+                    y >= GRID_H - 6,
+                    "steel should have stacked at the bottom of its column"
+                );
+            }
+        }
+        // Nothing strayed into the neighbouring columns.
+        assert_eq!(sim.count_mat(STEEL), before);
+        for y in 0..GRID_H {
+            assert_ne!(sim.mat_at(col - 1, y), STEEL, "steel shouldn't spread left");
+            assert_ne!(
+                sim.mat_at(col + 1, y),
+                STEEL,
+                "steel shouldn't spread right"
+            );
+        }
+    }
+
+    #[test]
+    fn tungsten_dents_stone_it_lands_on_but_steel_does_not() {
+        // Dropped from a height onto a stone slab, tungsten punches a hollow into
+        // it; steel of the same fall just comes to rest on the surface.
+        let dent_depth = |metal: MaterialId| -> usize {
+            let mut sim = Simulation::new();
+            let floor = GRID_H - 1;
+            let surface = floor - 20; // a thick stone slab with air above it
+            for x in 0..GRID_W {
+                for y in surface..=floor {
+                    sim.set(x, y, STONE);
+                }
+            }
+            let stone_before = sim.count_mat(STONE);
+            sim.set(100, 0, metal); // drop from the very top
+            for _ in 0..GRID_H {
+                sim.step();
+            }
+            // However much stone is gone is the depth of the dent it carved.
+            stone_before - sim.count_mat(STONE)
+        };
+        let tungsten = dent_depth(TUNGSTEN);
+        let steel = dent_depth(STEEL);
+        assert!(
+            tungsten > 0,
+            "tungsten should punch a dent into the stone it lands on"
+        );
+        assert_eq!(steel, 0, "steel shouldn't dent stone");
+    }
+
+    #[test]
+    fn lava_melts_iron_but_not_tungsten() {
+        // A bath of lava eats through iron — the soft metal of the three — but
+        // leaves tungsten standing.
+        let survives = |metal: MaterialId| -> bool {
+            let mut sim = Simulation::new();
+            sim.set_world_temp(40.0);
+            // A pool of lava with a plug of metal sunk in its middle.
+            for x in 90..110 {
+                for y in 100..120 {
+                    sim.set(x, y, LAVA);
+                }
+            }
+            for x in 98..102 {
+                for y in 108..112 {
+                    sim.set(x, y, metal);
+                }
+            }
+            let before = sim.count_mat(metal);
+            for _ in 0..2000 {
+                sim.step();
+            }
+            // "Survives" = at least some of the metal is still metal.
+            sim.count_mat(metal) >= before / 2
+        };
+        assert!(!survives(IRON), "lava should melt iron away");
+        assert!(survives(TUNGSTEN), "tungsten should withstand the lava");
+    }
+
+    #[test]
+    fn a_falling_metal_block_crushes_a_creature_beneath_it() {
+        // A creature standing in the path of a dropping iron block is crushed.
+        let mut sim = Simulation::new();
+        let floor = GRID_H - 1;
+        for x in 0..GRID_W {
+            sim.set(x, floor, STONE);
+        }
+        sim.spawn_entity(ANT, 100, floor as i32 - 1);
+        assert_eq!(sim.entity_count(), 1);
+        // A block of iron poised just above the ant, set falling onto it. Kept
+        // close so the ant is crushed before it can amble out from under it.
+        for y in (floor - 4)..(floor - 1) {
+            sim.set(100, y, IRON);
+        }
+        for _ in 0..6 {
+            sim.step();
+        }
+        assert_eq!(
+            sim.entity_count(),
+            0,
+            "the falling iron should have crushed the ant"
         );
     }
 }

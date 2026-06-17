@@ -28,12 +28,31 @@ fn lethal(m: MaterialId) -> bool {
     matches!(m, LAVA | FIRE)
 }
 
-/// Reap the creature if it's sitting in lava or fire. Returns `true` (so the
-/// caller bails out of the rest of its turn) when it died. Shared by every
-/// forager, so birds, fish, and ants all perish in the heat alike.
+/// Local temperature at which a creature is cooked by the surrounding heat alone,
+/// without standing in lava or flame. Far above any world's ambient climate (even
+/// the desert's), so only the searing air close to a lava lake or a fresh meteor
+/// scar is lethal — a creature can cross a hot desert unharmed but can't loiter at
+/// the edge of molten rock.
+const LETHAL_HEAT: f32 = 150.0;
+
+/// Reap the creature if it's sitting in lava or fire, or caught in air hot enough
+/// to cook it. Returns `true` (so the caller bails out of the rest of its turn)
+/// when it died. Shared by every forager, so birds, fish, and ants all perish in
+/// the heat alike.
 fn burned(sim: &Simulation, me: &mut EntityState) -> bool {
     let (x, y) = (me.x.round() as i32, me.y.round() as i32);
     if matches!(sim.cell_mat(x, y), Some(m) if lethal(m)) {
+        me.alive = false;
+        return true;
+    }
+    // Cooked by the ambient heat, not just a direct flame: anything caught in the
+    // scorching air around a lava lake succumbs even without touching it.
+    if x >= 0
+        && y >= 0
+        && (x as usize) < sim.width
+        && (y as usize) < sim.height
+        && sim.temp_at(x as usize, y as usize) >= LETHAL_HEAT
+    {
         me.alive = false;
         return true;
     }

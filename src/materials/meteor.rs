@@ -39,6 +39,8 @@ impl Material for Meteor {
             density: 250,
             movable: true,
             glow: true,
+            // A searing ball of molten rock — hotter even than lava.
+            source_temp: Some(1300.0),
         }
     }
 

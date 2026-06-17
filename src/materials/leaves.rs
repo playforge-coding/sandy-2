@@ -23,6 +23,7 @@ impl Material for Leaves {
             density: 255,
             movable: false,
             glow: false,
+            source_temp: None,
         }
     }
 

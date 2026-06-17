@@ -75,6 +75,7 @@ impl WorldType {
                 algae: true,
                 ants: true,
                 fish: true,
+                base_temp: 20.0, // temperate
             },
             // Almost flat, dry grassland: soil over stone, no sea, sparse trees/ants.
             WorldType::Plains => WorldParams {
@@ -88,6 +89,7 @@ impl WorldType {
                 algae: false,
                 ants: true,
                 fish: false,
+                base_temp: 28.0, // warm, dry
             },
             // A deep sea: water high up over a low, gently rolling sand bed.
             WorldType::Ocean => WorldParams {
@@ -101,6 +103,7 @@ impl WorldType {
                 algae: true,
                 ants: false,
                 fish: true,
+                base_temp: 6.0, // cold sea
             },
             // Arid dunes of sand over stone, no water, a scattering of ants.
             WorldType::Desert => WorldParams {
@@ -114,6 +117,7 @@ impl WorldType {
                 algae: false,
                 ants: true,
                 fish: false,
+                base_temp: 45.0, // scorching
             },
         }
     }
@@ -142,6 +146,10 @@ struct WorldParams {
     ants: bool,
     /// Seed fish in the deeper water?
     fish: bool,
+    /// The world's ambient temperature — the climate every heat tile relaxes
+    /// toward (see [`Simulation::set_world_temp`]). Hot deserts bake, cold seas
+    /// chill; local hot/cold materials warp it from there.
+    base_temp: f32,
 }
 
 /// How many cells of the ground's top layer are soil; everything below is stone.
@@ -179,6 +187,9 @@ pub fn generate_world(sim: &mut Simulation, seed: i32, world: WorldType) {
     sim.clear();
 
     let p = world.params();
+    // Set the climate before painting, so the heat field starts at this preset's
+    // ambient temperature everywhere (lava, water and weather warp it from there).
+    sim.set_world_temp(p.base_temp);
     let (w, h) = (sim.width, sim.height);
     let surface = heightmap(seed, w, h, &p);
     // The waterline, in cells. A fraction `>= 1.0` lands at (or past) the floor,

@@ -442,6 +442,15 @@ fn parse_info(map: &Map) -> Result<MaterialInfo, String> {
         .get("glow")
         .and_then(|d| d.as_bool().ok())
         .unwrap_or(false);
+    // Opt-in thermal field: a plugin can set `temp: 900` to make its material a
+    // heat source (or a negative-ish value to make it a cool sink) in the world's
+    // temperature field. Accepts an int or float; absent means thermally inert.
+    let source_temp = map.get("temp").and_then(|d| {
+        d.as_float()
+            .ok()
+            .map(|f| f as f32)
+            .or_else(|| d.as_int().ok().map(|i| i as f32))
+    });
 
     Ok(MaterialInfo {
         name,
@@ -450,6 +459,7 @@ fn parse_info(map: &Map) -> Result<MaterialInfo, String> {
         density,
         movable,
         glow,
+        source_temp,
     })
 }
 

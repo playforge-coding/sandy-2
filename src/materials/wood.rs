@@ -24,6 +24,7 @@ impl Material for Wood {
             density: 255,
             movable: false,
             glow: false,
+            source_temp: None,
         }
     }
 

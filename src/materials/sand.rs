@@ -19,6 +19,7 @@ impl Material for Sand {
             density: 150,
             movable: true,
             glow: false,
+            source_temp: None,
         }
     }
 

@@ -22,6 +22,7 @@ impl Material for Oil {
             density: 80,
             movable: true,
             glow: false,
+            source_temp: None,
         }
     }
 

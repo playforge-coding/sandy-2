@@ -21,6 +21,7 @@ impl Material for Soil {
             density: 255,
             movable: false,
             glow: false,
+            source_temp: None, // takes on the ambient temperature
         }
     }
 

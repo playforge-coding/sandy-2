@@ -26,6 +26,9 @@ impl Material for Rain {
             density: 40,
             movable: true,
             glow: false,
+            // Falling rain is cold — a passing shower cools the air it falls
+            // through.
+            source_temp: Some(5.0),
         }
     }
 

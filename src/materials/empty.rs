@@ -21,6 +21,7 @@ impl Material for Empty {
             density: 0,
             movable: false,
             glow: false,
+            source_temp: None,
         }
     }
 

@@ -27,6 +27,9 @@ impl Material for Fire {
             density: 5,
             movable: true,
             glow: true,
+            // Open flame: hot, though it burns out fast so the heat it leaves is
+            // fleeting compared with lava's.
+            source_temp: Some(700.0),
         }
     }
 

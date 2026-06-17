@@ -29,6 +29,7 @@ mod algae;
 mod cloud;
 mod empty;
 mod fire;
+mod iron;
 mod lava;
 mod leaves;
 mod meteor;
@@ -37,7 +38,9 @@ mod rain;
 mod sand;
 mod seeds;
 mod soil;
+mod steel;
 mod stone;
+mod tungsten;
 mod water;
 mod wet_soil;
 mod wood;
@@ -74,6 +77,12 @@ pub const SEEDS: MaterialId = 13;
 pub const METEOR: MaterialId = 14;
 /// An aquatic plant that creeps through water — the food fish graze on.
 pub const ALGAE: MaterialId = 15;
+/// Metals: heavy rigid solids that fall as a block and crush what they land on.
+/// In rising order of strength — iron the lava melts, steel that barely does, and
+/// tungsten that all but never melts and dents stone where it lands.
+pub const IRON: MaterialId = 16;
+pub const STEEL: MaterialId = 17;
+pub const TUNGSTEN: MaterialId = 18;
 
 /// A material's static, render- and physics-relevant properties.
 #[derive(Clone, Copy)]
@@ -92,6 +101,13 @@ pub struct MaterialInfo {
     /// renderer's bloom pass (it gives fire and lava their soft halo); see
     /// [`crate::sim::Simulation::render_into`] for how the flag is encoded.
     pub glow: bool,
+    /// The temperature this material pushes its surroundings toward, if it's a
+    /// heat source or sink at all. `Some(t)` makes every cell of this material
+    /// nudge its local-temperature tile toward `t` each tick (lava and fire heat,
+    /// water and rain cool); `None` is thermally inert — the cell just takes on
+    /// whatever the ambient temperature already is. Read by the coarse heat field
+    /// in [`crate::sim::Simulation`]; see [`crate::sim::Simulation::temp_at`].
+    pub source_temp: Option<f32>,
 }
 
 impl MaterialInfo {
@@ -168,9 +184,12 @@ fn builtins() -> Vec<&'static dyn Material> {
     static SEEDS: seeds::Seeds = seeds::Seeds; // id 13
     static METEOR: meteor::Meteor = meteor::Meteor; // id 14
     static ALGAE: algae::Algae = algae::Algae; // id 15
+    static IRON: iron::Iron = iron::Iron; // id 16
+    static STEEL: steel::Steel = steel::Steel; // id 17
+    static TUNGSTEN: tungsten::Tungsten = tungsten::Tungsten; // id 18
     vec![
         &EMPTY, &SAND, &STONE, &WATER, &LAVA, &OIL, &FIRE, &SOIL, &WOOD, &LEAVES, &CLOUD, &RAIN,
-        &WET_SOIL, &SEEDS, &METEOR, &ALGAE,
+        &WET_SOIL, &SEEDS, &METEOR, &ALGAE, &IRON, &STEEL, &TUNGSTEN,
     ]
 }
 

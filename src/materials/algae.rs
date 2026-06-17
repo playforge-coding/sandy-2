@@ -30,6 +30,7 @@ impl Material for Algae {
             density: 255,
             movable: false,
             glow: false,
+            source_temp: None,
         }
     }
 

@@ -28,6 +28,8 @@ impl Material for WetSoil {
             density: 255,
             movable: false,
             glow: false,
+            // Damp earth holds a little of the water's chill.
+            source_temp: Some(14.0),
         }
     }
 
